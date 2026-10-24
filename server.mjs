@@ -141,13 +141,20 @@ function encodeField(w, f, v, def) {
     }
     case "Map": {
       const entries = v instanceof Map ? Array.from(v.entries()) : Object.entries(v || {});
+      // 表里的 Map 值类型用 ref 表示（如 localStorage: Map<string, CacheInfo>），
+      // 老存档可能只存了字符串，这里自动补成 {value, dt}
+      const valRef = def.valRef || def.ref;
+      const valIsObj = def.valType === "object" || (!def.valType && !!valRef);
+      const valType = def.valType || (valIsObj ? "object" : "string");
       for (const [k, val] of entries) {
         const sub = new Writer();
         sub.tag(1, wireTypeOf(def.keyType || "string"));
         encodeScalar(sub, def.keyType || "string", k);
-        sub.tag(2, wireTypeOf(def.valType || "uint32"));
-        if (def.valType === "object") sub.bytes(encode(def.valRef, val));
-        else encodeScalar(sub, def.valType || "uint32", val);
+        sub.tag(2, wireTypeOf(valType));
+        if (valIsObj) {
+          const inner = val && typeof val === "object" ? val : { value: String(val), dt: 0 };
+          sub.bytes(encode(valRef, inner));
+        } else encodeScalar(sub, valType, val);
         w.tag(f.tag, 2);
         w.bytes(sub.result());
       }
@@ -260,7 +267,7 @@ function decodeInto(obj, name, buf, mapDefs) {
         obj[f.name].push(f.type === "object" ? decode(f.ref, readBytes(buf, pos), mapDefs) : decodeScalar(buf, pos, f.type));
       }
     } else if (f.rule === "Map") {
-      const md = (mapDefs || {})[name + "." + f.name] || {};
+      const md = Object.assign({}, f, (mapDefs || {})[name + "." + f.name] || {});
       const sub = readBytes(buf, pos);
       const e = readMapEntry(sub, md);
       if (!obj[f.name]) obj[f.name] = {};
@@ -281,8 +288,9 @@ function readMapEntry(buf, md) {
     const tag = k >> 3;
     if (tag === 1) key = decodeScalar(buf, pos, md.keyType || "string");
     else if (tag === 2) {
-      if (md.valType === "object") val = decode(md.valRef, readBytes(buf, pos), null);
-      else val = decodeScalar(buf, pos, md.valType || "uint32");
+      const vRef = md.valRef || md.ref;
+      if (md.valType === "object" || (!md.valType && vRef)) val = decode(vRef, readBytes(buf, pos), null);
+      else val = decodeScalar(buf, pos, md.valType || "string");
     } else {
       if ((k & 7) === 0) readVarint(buf, pos);
       else if ((k & 7) === 2) readBytes(buf, pos);
@@ -381,7 +389,7 @@ function defaultPlayer() {
     // 客户端会 JSON.parse 后当字典用，必须是对象字符串，不能是纯数字
     guide: "{}",
     guideFlag: true,
-    localStorage: {},
+    localStorage: { UnlockFun: { value: "51000,5300,2201,49000", dt: 0 } },
   };
 }
 
