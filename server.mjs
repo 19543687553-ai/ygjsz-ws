@@ -509,6 +509,44 @@ function buildCommonInfo(p) {
   return o;
 }
 
+// 挂机（离线收益）基础信息：时间拉满，客户端才会显示"已满"并允许领取
+function adventureInfo(p) {
+  return {
+    level: 1,
+    chapterId: 1,
+    lessTimes: 0,
+    buyTimes: 0,
+    getDt: p.createDt,
+    targetList: [],
+    hangUpExtendTime: 0,
+    levelRewardFlag: [],
+    shareNum: 0,
+    shareFlag: [],
+    alreadyReward: [],
+    inspireEndDt: 0,
+    inspireType: 0,
+    drumBuyLimit: {},
+    buyRechargeCard: false,
+    levelInfos: [],
+    sweepTimes: 3,
+    flushTime: 0,
+    infoList: [],
+    storageTimes: 0,
+    isGetFirstCustoms: false,
+    hangUpTime: 43200,
+    maxHangUpTime: 43200,
+  };
+}
+
+// 离线挂机奖励：type 1=金币 2=钻石 3=道具
+function hangUpRewards() {
+  return [
+    { type: 1, code: 1, num: 500000 },
+    { type: 2, code: 2, num: 5000 },
+    { type: 3, code: 30000004, num: 100 },
+  ];
+}
+
 function legacyCommonInfo(p) {
   const t = now();
   return {
@@ -725,6 +763,34 @@ function handle(conn, mod, cmd, ssid, body, ctx) {
     }
     if (cmd === 3) {
       reply(4, "PingR_BuildRoom_S2C", { err: 0, sysDt: now() });
+      return true;
+    }
+    return false;
+  }
+
+  // 冒险 / 挂机收益 module 11（Adventure）
+  if (mod === 11) {
+    if (cmd === 13) {
+      reply(14, "GetHangUpShowRewardsR_Adventure_S2C", {
+        err: 0,
+        info: adventureInfo(p),
+        showRewards: hangUpRewards(),
+      });
+      return true;
+    }
+    if (cmd === 8) {
+      const got = hangUpRewards();
+      for (const r of got) {
+        const it = p.items.find((x) => x.code === r.code);
+        if (it) it.num += r.num;
+        else p.items.push({ code: r.code, num: r.num });
+      }
+      queueSave(p);
+      reply(9, "GetHangUpRewardsR_Adventure_S2C", {
+        err: 0,
+        info: adventureInfo(p),
+        clientReward: { items: got },
+      });
       return true;
     }
     return false;
