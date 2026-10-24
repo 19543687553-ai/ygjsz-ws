@@ -867,11 +867,10 @@ function attach(socket, gameUrl) {
   })();
 }
 
-// 握手地址换成 wss://host（客户端拿它连房间服）
+// 游戏服地址：必须不带协议（客户端会自己拼 wss://，带了就变成 wss://wss//...）
 function wsUrlOf(req) {
   const u = new URL(req.url);
-  const proto = u.protocol === "https:" ? "wss:" : "ws:";
-  return proto + "//" + u.host;
+  return u.host + "/";
 }
 
 // 静态资源代理：页面用 <base> 指向本服务的 /res/，
