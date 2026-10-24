@@ -874,10 +874,36 @@ function wsUrlOf(req) {
   return proto + "//" + u.host;
 }
 
+// 静态资源代理：页面用 <base> 指向本服务的 /res/，
+// 其余缺省资源回源官方 CDN，remoteConfig（CDN 上没有）回源 PHP 主机
+const CDN_RES = "https://menggui-cdnres.bhsg.lintey.com/huawei/web-mobile";
+const PHP_ORIGIN = PHP_BASE.replace(/\/sy_api\/?$/, "");
+
+async function serveRes(pathAfterRes) {
+  const rel = pathAfterRes.replace(/^\/+/, "");
+  const cors = {
+    "access-control-allow-origin": "*",
+    "cache-control": "public, max-age=86400",
+  };
+  if (!rel || rel.includes("..")) return new Response("bad path", { status: 400, headers: cors });
+  const src = rel.startsWith("remoteConfig/") ? PHP_ORIGIN + "/" + rel : CDN_RES + "/" + rel;
+  let r;
+  try {
+    r = await fetch(src, { headers: { "user-agent": "ygjsz-private/1.0" } });
+  } catch (e) {
+    return new Response("upstream fail: " + e.message, { status: 502, headers: cors });
+  }
+  if (!r.ok) return new Response(String(r.status), { status: r.status, headers: cors });
+  const h = new Headers(cors);
+  h.set("content-type", r.headers.get("content-type") || "application/octet-stream");
+  return new Response(r.body, { status: 200, headers: h });
+}
+
 Deno.serve({ port: PORT }, async (req) => {
   const upgrade = (req.headers.get("upgrade") || "").toLowerCase();
   if (upgrade !== "websocket") {
     const u = new URL(req.url);
+    if (u.pathname.startsWith("/res/")) return await serveRes(u.pathname.slice(5));
     if (u.pathname === "/health") {
       let t = "not loaded";
       try {
