@@ -786,10 +786,15 @@ function handle(conn, mod, cmd, ssid, body, ctx) {
         else p.items.push({ code: r.code, num: r.num });
       }
       queueSave(p);
+      const after = adventureInfo(p);
+      after.hangUpTime = 0; // 已领取，清空挂机时长，客户端才会收起弹窗
       reply(9, "GetHangUpRewardsR_Adventure_S2C", {
         err: 0,
-        info: adventureInfo(p),
-        clientReward: { items: got },
+        info: after,
+        clientReward: {
+          money: got.filter((r) => r.type <= 2),
+          items: got.filter((r) => r.type >= 3),
+        },
       });
       return true;
     }
