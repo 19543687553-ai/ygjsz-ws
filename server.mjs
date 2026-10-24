@@ -861,14 +861,19 @@ function handle(conn, mod, cmd, ssid, body, ctx) {
       return true;
     }
     if (cmd === 36) {
-      reply(37, "GetPowerInfoR_Adventure_S2C", { err: 0, lessTimes: 0, flushTime: now() });
+      // 主线体力查询，和 AdventureInfo.lessTimes 保持一致，
+      // 否则界面/校验一边是 25 一边是 0，会莫名提示体力不足
+      reply(37, "GetPowerInfoR_Adventure_S2C", { err: 0, lessTimes: 25, flushTime: now() });
       return true;
     }
     if (cmd === 13) {
+      // 挂机收益预览：真实账号 hangUpTime=0 时服务端回空奖励，
+      // 客户端就不会弹「挂机收益」窗口。之前这里固定回一堆奖励，
+      // 导致一登录/一进战斗就弹窗，而且没完整数据时点「领取」关不掉。
       reply(14, "GetHangUpShowRewardsR_Adventure_S2C", {
         err: 0,
-        info: adventureInfo(p),
-        showRewards: hangUpRewards(),
+        info: { ...adventureInfo(p), hangUpTime: 0 },
+        showRewards: [],
       });
       return true;
     }
