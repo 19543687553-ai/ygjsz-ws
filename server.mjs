@@ -668,7 +668,6 @@ function handle(conn, mod, cmd, ssid, body, ctx) {
       });
       return true;
     }
-    return false;
   }
 
   // 游戏服 module 2 (LoginGame)
@@ -732,7 +731,6 @@ function handle(conn, mod, cmd, ssid, body, ctx) {
       reply(19, "SetLocalStorageR_LoginGame_S2C", { err: 0 });
       return true;
     }
-    return false;
   }
 
   // 战斗房间 module 82 (Build)
@@ -752,7 +750,6 @@ function handle(conn, mod, cmd, ssid, body, ctx) {
       reply(5, "QuitRoomR_Build_S2C", { err: 0 });
       return true;
     }
-    return false;
   }
 
   // 房间服 module 90 (BuildRoom)
@@ -765,11 +762,18 @@ function handle(conn, mod, cmd, ssid, body, ctx) {
       reply(4, "PingR_BuildRoom_S2C", { err: 0, sysDt: now() });
       return true;
     }
-    return false;
   }
 
   // 冒险 / 挂机收益 module 11（Adventure）
   if (mod === 11) {
+    if (cmd === 4) {
+      reply(5, "GetAdventureInfoR_Adventure_S2C", { err: 0, info: adventureInfo(p) });
+      return true;
+    }
+    if (cmd === 36) {
+      reply(37, "GetPowerInfoR_Adventure_S2C", { err: 0, lessTimes: 0, flushTime: now() });
+      return true;
+    }
     if (cmd === 13) {
       reply(14, "GetHangUpShowRewardsR_Adventure_S2C", {
         err: 0,
@@ -798,7 +802,6 @@ function handle(conn, mod, cmd, ssid, body, ctx) {
       });
       return true;
     }
-    return false;
   }
 
   // 套装 module 110
@@ -810,7 +813,6 @@ function handle(conn, mod, cmd, ssid, body, ctx) {
       });
       return true;
     }
-    return false;
   }
 
   // GM / Test module 5
