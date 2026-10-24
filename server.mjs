@@ -405,6 +405,44 @@ const saveTimers = new Map();
 // 从官方抓包（2/12）里抄下来的已完成新手引导步骤
 const GUIDE_DEFAULT = '{"10019000":1,"10021000":1,"10013000":1,"10022000":1,"10020000":1}';
 
+// 战场建筑模板：官方抓包里 90/12 StartGameP 每个玩家都带 109 条 builds。
+// 少带的话客户端排布房间/机械时会缺格子，打完一关再进下一关容易卡住。
+function buildNums() {
+  const out = [1, 2, 3, 4];
+  for (let i = 1024; i <= 1036; i++) out.push(i);
+  out.push(1038, 9999);
+  for (let i = 4001; i <= 4036; i++) out.push(i);
+  for (let i = 3013; i <= 3019; i++) out.push(i);
+  out.push(2001, 2002, 2003, 3009, 3012, 4038, 3006, 3007, 3008, 3010, 2011, 2012, 2013, 3011);
+  out.push(3001, 3002, 3003, 3004, 3005, 1001);
+  for (let i = 2021; i <= 2025; i++) out.push(i);
+  for (let i = 1002; i <= 1023; i++) out.push(i);
+  return out;
+}
+const BUILD_NUMS = buildNums();
+const BUILD_ATTR12 = new Set([
+  ...Array.from({ length: 15 }, (_, i) => 1024 + i),
+  ...Array.from({ length: 36 }, (_, i) => 4001 + i),
+  4038,
+  ...Array.from({ length: 23 }, (_, i) => 1001 + i),
+]);
+
+function buildList() {
+  return BUILD_NUMS.map((t) => {
+    if (t <= 4) {
+      return { type: t, skinId: t * 10000, skinLevel: 1, attr: { 1: t === 1 ? 10 : 1 } };
+    }
+    return { type: t, attr: BUILD_ATTR12.has(t) ? { 12: 0 } : { 1: 1 } };
+  });
+}
+
+// 抓包真实数据里的 5 个机器人（playerId < 1e5 客户端会当敌方）
+const ROBOT_IDS = [11041, 11012, 11014, 11006, 11009];
+// 抓包 StartGameP 顶层的版本号，客户端没传时用它们兜底
+const BATTLE_VER = "2.3.1-2_E147072_P147121_C145037";
+const CONFIG_VER_BATTLE = "hunfu_147127";
+const MAP_VER = "trunk_141409";
+
 function defaultPlayer() {
   return {
     playerId: REPLAY.playerId || PLAYER_ID,
@@ -428,8 +466,20 @@ function defaultPlayer() {
     guide: GUIDE_DEFAULT,
     guideFlag: false,
     localStorage: { UnlockFun: { value: "51000,5300,2201,49000", dt: 0 } },
-    // GM 改过英雄等级后记在这，23/1 回包时套用
+    // 主线关卡：打完一关要往前推，否则下一关点不动
+    adventureLevel: 2,
+    // GM 改过英雄等级/突破后记在这，23/1 和 StartGameP 里套用
     heroLevel: 0,
+    heroBreakThrough: 0,
+    heroStar: 0,
+    // GM 添加的英雄（{code, level}）
+    extraHeros: [],
+    // GM 给的武将碎片（和 items 分开，客户端按 chipItems 显示）
+    chipItems: [],
+    // 上次进入的战斗，QuitRoom 结算时要用
+    lastBattleLevel: 0,
+    lastBattleType: 0,
+    lastBattleUuid: "",
   };
 }
 
@@ -515,19 +565,48 @@ function commonTemplateOf() {
   return commonTemplate;
 }
 
-function buildCommonInfo(p) {
+// 完整的玩家信息：13/5 PlayerInfoP 会直接覆盖客户端本地的 _playerInfo.info，
+// 少字段的话 _updateBuildSkinRed 里读 moduleBaseList 会直接抛错，
+// 所以一律以抓包里 2/12 的 playerInfo 为底，只覆盖会变的那几个。
+function playerInfoOf(p) {
   const tpl = commonTemplateOf();
-  if (!tpl) return legacyCommonInfo(p);
-  const o = deepClone(tpl);
-  o.playerItem = o.playerItem || {};
-  o.playerItem.err = 0;
-  o.playerItem.items = p.items.map((it) => ({
+  let info = tpl && tpl.playerInfo && tpl.playerInfo.info
+    ? deepClone(tpl.playerInfo.info)
+    : deepClone(legacyCommonInfo(p).playerInfo.info);
+  info.playerId = p.playerId;
+  info.name = p.name;
+  info.level = p.level;
+  info.exp = p.exp;
+  info.createDt = p.createDt;
+  return info;
+}
+
+function bagItemsOf(p) {
+  return p.items.map((it) => ({
     code: it.code,
     num: it.num,
     dt: p.createDt,
     expiredDt: 0,
     playerLevel: p.level,
   }));
+}
+
+function buildCommonInfo(p) {
+  const tpl = commonTemplateOf();
+  if (!tpl) return legacyCommonInfo(p);
+  const o = deepClone(tpl);
+  o.playerItem = o.playerItem || {};
+  o.playerItem.err = 0;
+  o.playerItem.items = bagItemsOf(p);
+  if (Array.isArray(p.chipItems) && p.chipItems.length) {
+    o.playerItem.chipItems = p.chipItems.map((it) => ({
+      code: it.code,
+      num: it.num,
+      dt: p.createDt,
+      expiredDt: 0,
+      playerLevel: p.level,
+    }));
+  }
   if (o.playerInfo && o.playerInfo.info) {
     const i = o.playerInfo.info;
     i.playerId = p.playerId;
@@ -580,6 +659,37 @@ function heroFull() {
   return heroFullTpl;
 }
 
+function heroTouched(p) {
+  return !!(p.heroLevel || p.heroStar || p.heroBreakThrough || (p.extraHeros && p.extraHeros.length));
+}
+
+// 套上 GM 改过的等级 / 星级 / 突破 / 新加的英雄，返回给客户端和战斗服共用
+function heroListOf(p) {
+  const list = (heroList() || []).map((h) => {
+    const o = deepClone(h);
+    if (p.heroLevel) o.level = p.heroLevel;
+    if (p.heroStar) o.section = p.heroStar;
+    if (p.heroBreakThrough) o.breakThrough = p.heroBreakThrough;
+    return o;
+  });
+  for (const eh of p.extraHeros || []) {
+    const code = Number(eh.code) || 0;
+    if (!code) continue;
+    if (list.some((h) => Number(h.code) === code)) continue;
+    list.push({
+      uuid: "gm_" + code,
+      code,
+      level: Number(eh.level) || p.heroLevel || 1,
+      section: 0,
+      breakThrough: p.heroBreakThrough || 0,
+      attr: { 1: 100 },
+      fightCap: 1000,
+      skills: [],
+    });
+  }
+  return list;
+}
+
 // 挂机（离线收益）基础信息
 // isGetFirstCustoms 是主城「开始挑战」按钮的开关：
 // AdventureMainCom 里 btn_adv_challenge.active = isGetFirstCoustomReward && 状态!=LOCK，
@@ -588,7 +698,7 @@ function heroFull() {
 // hangUpTime 给 0：不要一登录就弹离线收益窗
 function adventureInfo(p) {
   return {
-    level: 2,
+    level: Number(p.adventureLevel) || 2,
     chapterId: 1,
     // 主线体力：AdventureMainCom._onBtnChalenge 里先判断
     // getNewAdvLessTime() < costs[2]，不足就直接弹「购买体力」窗口，
@@ -627,6 +737,20 @@ function hangUpRewards() {
     { type: 2, code: 2, num: 5000 },
     { type: 3, code: 30000004, num: 100 },
   ];
+}
+
+// ---------------- 主动推送 ----------------
+// GM 改完数值 / 打完一关推进关卡后必须主动推，否则客户端界面还停在旧数据
+function pushAdvInfo(conn, p) {
+  conn.send(encodeS2C(11, 12, 0, tryEncode("AdventureInfoP_Adventure_S2C", { info: adventureInfo(p) })));
+}
+
+function pushPlayerInfo(conn, p) {
+  conn.send(encodeS2C(13, 5, 0, tryEncode("PlayerInfoP_PlayerInfo_S2C", { info: playerInfoOf(p) })));
+}
+
+function pushHeroInfo(conn, p) {
+  conn.send(encodeS2C(23, 9, 0, tryEncode("HeroInfoP_Hero_S2C", { heroList: heroListOf(p) })));
 }
 
 function legacyCommonInfo(p) {
@@ -703,7 +827,7 @@ function sendPushes(conn) {
 
 // 这些指令由本地逻辑处理，其余优先回放抓包里的真实回包
 // 2/12 先直接用抓包真实回包：自己重编码的字段类型和客户端对不上，解析会报错
-const OWN_CMDS = new Set(["1/2", "2/1", "2/6", "2/8", "2/14", "2/18", "5/174", "82/1", "82/4", "90/1", "90/3"]);
+const OWN_CMDS = new Set(["1/2", "2/1", "2/6", "2/8", "2/14", "2/18", "5/174", "82/1", "82/4", "82/6", "90/1", "90/3"]);
 
 // ---------------- 路由 ----------------
 function handle(conn, mod, cmd, ssid, body, ctx) {
@@ -728,7 +852,8 @@ function handle(conn, mod, cmd, ssid, body, ctx) {
   // 抓包里录到的真实回包优先
   const key0 = mod + "/" + cmd;
   // 23/1 被 GM 改过英雄等级时要自己编码，不能直接回放旧包
-  const forceOwn = mod === 23 && cmd === 1 && p.heroLevel;
+  const heroGm = mod === 23 && cmd === 1 && heroTouched(p);
+  const forceOwn = heroGm;
   if (!forceOwn && !OWN_CMDS.has(key0) && REPLAY.pairs && REPLAY.pairs[key0]) {
     const rp0 = REPLAY.pairs[key0];
     conn.send(encodeS2C(mod, rp0.replyCmd, ssid, Buffer.from(rp0.raw, "base64"), rp0.comp));
@@ -826,6 +951,11 @@ function handle(conn, mod, cmd, ssid, body, ctx) {
       const bt = req ? Number(req.battleType) || 0 : 0;
       const lv = req ? Number(req.level) || 1 : 1;
       const auth = "yg" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+      // 记下来：QuitRoom 结算回包要用同一个 uuid，过关推进要用关卡号
+      p.lastBattleLevel = lv;
+      p.lastBattleType = bt;
+      p.lastBattleUuid = auth;
+      queueSave(p);
       const host = String(ctx.gameUrl || "").replace(/\/+$/, "");
       const vs = req
         ? "&bv=" + encodeURIComponent(req.battleVersion || "") +
@@ -843,7 +973,26 @@ function handle(conn, mod, cmd, ssid, body, ctx) {
       return true;
     }
     if (cmd === 4) {
-      reply(5, "QuitRoomR_Build_S2C", { err: 0 });
+      // 结算：_handleQuitRoomRData 里 t.err != 0 会直接把战斗判负并弹错误码，
+      // t.uuid 为空则 _finishQuitSettlement 不会再发 13/47 VerifyArrival，
+      // 关卡进度就卡死了 —— 所以这三个字段必须回全。
+      const rt = req ? Number(req.type) || 0 : 0;
+      const uuid = p.lastBattleUuid || "";
+      if (rt === 1 && p.lastBattleType === 3) {
+        // 主线（HangUpSystem）打赢：关卡往后推一格，
+        // 不推进的话客户端一直停在同一关，表现就是「不能下一关」
+        const next = Math.max(Number(p.adventureLevel) || 1, (Number(p.lastBattleLevel) || 0) + 1);
+        p.adventureLevel = next;
+        queueSave(p);
+        log("[battle] 主线过关 → " + next);
+        pushAdvInfo(conn, p);
+      }
+      reply(5, "QuitRoomR_Build_S2C", { err: 0, result: 1, uuid });
+      return true;
+    }
+    if (cmd === 6) {
+      // 未完成房间查询：battleType 必须回 0，否则客户端会自动放弃上一局
+      reply(7, "UnfinishedRoomR_Build_S2C", { err: 0, battleType: 0 });
       return true;
     }
   }
@@ -907,15 +1056,14 @@ function handle(conn, mod, cmd, ssid, body, ctx) {
 
   // 英雄 module 23：升级 / 升阶等都基于抓包里的真实英雄数据
   if (mod === 23) {
-    if (cmd === 1 && p.heroLevel) {
+    if (cmd === 1 && heroTouched(p)) {
       const tpl = heroFull();
       if (tpl) {
         try {
           const o = deepClone(tpl);
           o.err = 0;
-          if (Array.isArray(o.heroList)) {
-            for (const h of o.heroList) h.level = p.heroLevel;
-          }
+          // GM 改过的等级/星级/突破，以及 GM 新增的英雄全在这
+          o.heroList = heroListOf(p);
           reply(2, "GetHeroInfoR_Hero_S2C", o);
           return true;
         } catch (e) {
@@ -924,7 +1072,7 @@ function handle(conn, mod, cmd, ssid, body, ctx) {
       }
     }
     if (cmd === 3) {
-      const list = heroList();
+      const list = heroListOf(p);
       const h = list.find((x) => x.uuid === (req && req.uuid)) || list[0];
       if (h) {
         const up = deepClone(h);
@@ -935,7 +1083,7 @@ function handle(conn, mod, cmd, ssid, body, ctx) {
       }
     }
     if (cmd === 5 || cmd === 7) {
-      const list = heroList();
+      const list = heroListOf(p);
       const h = list.find((x) => x.uuid === (req && req.uuid)) || list[0];
       if (h) {
         const up = deepClone(h);
@@ -1008,8 +1156,17 @@ function handle(conn, mod, cmd, ssid, body, ctx) {
 
   // GM / Test module 5
   if (mod === 5 && cmd === 174) {
-    const ret = runGM(p, req || {});
-    reply(175, "MakeTestOperR_Test_S2C", { err: 0, retExtra: ret, status: "ok" });
+    const r = runGM(p, req || {});
+    const body = { err: 0, retExtra: r.ret, status: "ok" };
+    // 回包里带 clientReward，客户端才会真的结算并弹奖励窗
+    if (r.reward && (r.reward.money.length || r.reward.items.length || r.reward.chipItems.length)) {
+      body.clientReward = r.reward;
+    }
+    reply(175, "MakeTestOperR_Test_S2C", body);
+    // 改完主动推送，否则界面上的等级/英雄/关卡还是旧数值
+    if (r.player) pushPlayerInfo(conn, p);
+    if (r.hero) pushHeroInfo(conn, p);
+    if (r.adv) pushAdvInfo(conn, p);
     return true;
   }
 
@@ -1044,13 +1201,76 @@ function parseExtra(s) {
   }
 }
 
+// GM 面板的 gmStr 统一是「前缀_数字」或「前缀_{ json }」
+function splitGmStr(s) {
+  const i = s.indexOf("{");
+  return {
+    head: i >= 0 ? s.slice(0, i) : s,
+    args: i >= 0 ? parseExtra(s.slice(i)) : null,
+  };
+}
+
+// GM 回包里的 clientReward 会被客户端 TestProxy.MakeTestOperRResponse
+// 丢给 EntityDataParser.handleClientRewardAndCost 直接结算并弹奖励窗，
+// 所以发东西必须按协议分桶，否则界面只显示“成功”但数值不变。
+function gmReward(out, type, code, num) {
+  if (!out.reward) out.reward = { money: [], items: [], chipItems: [] };
+  const e = { type, code, num };
+  if (type === 1) out.reward.money.push(e);
+  else if (type === 4) out.reward.chipItems.push(e);
+  else out.reward.items.push(e);
+}
+
+function gmMoney(p, code, num, out) {
+  if (code === 1) {
+    p.money.gold += num;
+    out.msg.push("金币+" + num);
+  } else if (code === 2) {
+    p.money.diamond += num;
+    out.msg.push("钻石+" + num);
+  }
+  gmReward(out, 1, code, num);
+}
+
+function gmItem(p, code, num, chip, out) {
+  code = Number(code) || 0;
+  num = Number(num) || 0;
+  if (!code || !num) return;
+  if (chip) {
+    p.chipItems = p.chipItems || [];
+    const it = p.chipItems.find((x) => x.code === code);
+    if (it) it.num += num;
+    else p.chipItems.push({ code, num });
+  } else {
+    const it = p.items.find((x) => x.code === code);
+    if (it) it.num += num;
+    else p.items.push({ code, num });
+  }
+  gmReward(out, chip ? 4 : 3, code, num);
+  out.msg.push(itemName(code) + "×" + num);
+}
+
 function runGM(p, req) {
   const cmd = String(req.cmd || "");
   const extra = String(req.extra || "");
+  const out = { ret: "ok", reward: null, hero: false, adv: false, player: false, msg: [] };
   log("[GM] cmd=" + cmd + " extra=" + extra);
 
-  // "增加资源/添加货币/添加道具" 都是这条：rewards = [[type, code, num], ...]
-  // type 1 = 货币（code 1 金币 / 2 钻石），type 3 = 道具
+  const done = () => {
+    queueSave(p);
+    out.ret = out.msg.length ? out.msg.join("，") : "ok";
+    return out;
+  };
+
+  // GM 面板里走 GMModule.send 的高级指令会先问这个，必须回合法 JSON，
+  // 否则客户端 JSON.parse 直接抛异常
+  if (cmd === "getPackageAndOperId") {
+    out.ret = JSON.stringify({ id1: 0, id2: 0 });
+    return out;
+  }
+
+  // "增加资源/添加货币/添加道具/加碎片/加神兵" 都是这条：
+  // rewards = [[type, code, num], ...]，type 1=货币 3=道具 4=碎片 25=神兵
   if (cmd === "AddRewards") {
     const a = parseExtra(extra) || {};
     let list = a.rewards;
@@ -1061,78 +1281,173 @@ function runGM(p, req) {
         list = null;
       }
     }
-    if (!Array.isArray(list)) return "bad rewards";
-    const parts = [];
+    if (!Array.isArray(list)) {
+      out.ret = "bad rewards";
+      return out;
+    }
     for (const r of list) {
       if (!Array.isArray(r) || r.length < 3) continue;
       const type = Number(r[0]);
       const code = Number(r[1]);
       const num = Number(r[2]) || 0;
-      if (type === 1) {
-        if (code === 1) {
-          p.money.gold += num;
-          parts.push("金币+" + num);
-        } else if (code === 2) {
-          p.money.diamond += num;
-          parts.push("钻石+" + num);
-        }
-      } else if (addItem(p, code, num)) {
-        parts.push(itemName(code) + "×" + num);
-      }
+      if (type === 1) gmMoney(p, code, num, out);
+      else gmItem(p, code, num, type === 4, out);
     }
-    queueSave(p);
-    return "ok " + (parts.join("，") || "无变化");
+    return done();
   }
 
   if (cmd === "addItem") {
     const a = parseExtra(extra) || {};
-    const code = Number(a.code || a.id || 0);
-    const num = Number(a.num || a.count || 0);
-    return addItem(p, code, num) ? "added " + code + " x" + num + " (" + itemName(code) + ")" : "bad code";
+    gmItem(p, Number(a.code || a.id || 0), Number(a.num || a.count || 0), false, out);
+    return done();
   }
 
   if (cmd === "addExp") {
     const a = parseExtra(extra) || {};
     const num = Number(a.num || 0);
     p.exp = (p.exp || 0) + num;
-    queueSave(p);
-    return "经验+" + num + "（总 " + p.exp + "）";
+    out.player = true;
+    out.msg.push("经验+" + num);
+    return done();
   }
 
-  // 直接改玩家等级：setLevel_99
-  if (/^setLevel_\d+/.test(extra)) {
-    const n = Number(extra.split("_")[1]) || 1;
-    p.level = n;
-    queueSave(p);
-    return "等级 → " + n;
-  }
-
-  // 所有英雄等级：gm_hero_setAllHeroLevelGM_{ "level": 99 }
-  if (/^gm_hero_setAllHeroLevelGM_/.test(extra)) {
-    const i = extra.indexOf("{");
-    const a = i > 0 ? parseExtra(extra.slice(i)) : null;
-    const lv = a && Number(a.level);
-    if (lv) {
-      p.heroLevel = lv;
-      queueSave(p);
-      return "所有英雄等级 → " + lv;
-    }
-    return "ok";
-  }
-
-  if (/^addItem_\d+/.test(extra)) {
-    const a = extra.split("_");
-    return addItem(p, Number(a[1]), Number(a[2] || 1)) ? "added " + a[1] : "bad";
-  }
-
+  // 跳关：GMCustomCommand 覆盖后发的是纯数字，面板原本的 expression 是 {"code":..}
   if (cmd === "adventureSkipLevel") {
-    p.adventureLevel = Number(extra) || 1;
-    queueSave(p);
-    return "adventureLevel=" + p.adventureLevel;
+    let lv = Number(extra) || 0;
+    if (!lv) {
+      const a = parseExtra(extra) || {};
+      lv = Number(a.code || a.num || 0);
+    }
+    if (!lv) {
+      out.ret = "bad level";
+      return out;
+    }
+    p.adventureLevel = lv;
+    out.adv = true;
+    out.msg.push("主线关卡 → " + lv);
+    return done();
   }
 
-  // 其余 GM 指令（装备、神器、遗物等）本服没有对应系统，回 ok 让客户端继续
-  return "ok";
+  // 其余 GM 指令全是 gmStr，extra 形如「前缀_数字」或「前缀_{ ... }」
+  const g = splitGmStr(extra);
+  const head = g.head;
+  const a = g.args || {};
+
+  // 加英雄：gm_hero_createHeroGM_{ "code": 50000001 }
+  if (head === "gm_hero_createHeroGM_") {
+    const code = Number(a.code) || 0;
+    if (!code) {
+      out.ret = "bad code";
+      return out;
+    }
+    p.extraHeros = p.extraHeros || [];
+    if (!p.extraHeros.some((x) => Number(x.code) === code)) {
+      p.extraHeros.push({ code, level: Number(a.level) || p.heroLevel || 1 });
+    }
+    out.hero = true;
+    out.msg.push("新增英雄 " + code);
+    return done();
+  }
+
+  // 全英雄星级 / 突破：gm_hero_giveAllNStarHero_{ "star": 6 } / {"breakThrough": 5}
+  if (head === "gm_hero_giveAllNStarHero_") {
+    if (a.star) {
+      p.heroStar = Number(a.star) || 0;
+      out.msg.push("全英雄星级 → " + p.heroStar);
+    }
+    if (a.breakThrough) {
+      p.heroBreakThrough = Number(a.breakThrough) || 0;
+      out.msg.push("全英雄突破 → " + p.heroBreakThrough);
+    }
+    out.hero = true;
+    return done();
+  }
+
+  // 全英雄等级：gm_hero_setAllHeroLevelGM_{ "level": 99 }
+  if (head === "gm_hero_setAllHeroLevelGM_") {
+    const lv = Number(a.level) || 0;
+    if (!lv) {
+      out.ret = "bad level";
+      return out;
+    }
+    p.heroLevel = lv;
+    out.hero = true;
+    out.msg.push("全英雄等级 → " + lv);
+    return done();
+  }
+
+  // 一键升级召唤师：gm_summoner_oneClickUpGradeGM_{ "reincarnateTimes": 0, "level": 99 }
+  if (head === "gm_summoner_oneClickUpGradeGM_") {
+    const lv = Number(a.level) || 0;
+    if (lv) {
+      p.level = lv;
+      out.player = true;
+      out.msg.push("玩家等级 → " + lv);
+    }
+    return done();
+  }
+
+  // 玩家等级：setLevel_99
+  if (/^setLevel_/.test(head)) {
+    const n = Number(head.split("_")[1]) || 0;
+    if (!n) {
+      out.ret = "bad level";
+      return out;
+    }
+    p.level = n;
+    out.player = true;
+    out.msg.push("玩家等级 → " + n);
+    return done();
+  }
+
+  // 道具：addItem_30000001_100
+  if (/^addItem_/.test(head)) {
+    const s = head.split("_");
+    gmItem(p, Number(s[1]), Number(s[2] || 1), false, out);
+    return done();
+  }
+
+  // 装备 / 神器 / 机关 / 远征 / 爬塔：本服没有对应养成系统，
+  // 至少把数值记下来并给明确回执，别让用户以为点了没反应
+  if (head === "gm_equip_setAllPosLevelGM_") {
+    p.equipLevel = Number(a.level) || 0;
+    out.msg.push("装备等级 → " + p.equipLevel);
+    return done();
+  }
+  if (head === "gm_artifact_oneClickUpGrade_") {
+    p.artifactLevel = Number(a.level) || 0;
+    out.msg.push("神器等级 → " + p.artifactLevel);
+    return done();
+  }
+  if (head === "gm_organ_gmUpOrgan_") {
+    p.organStar = Number(a.star) || 0;
+    p.organLevel = Number(a.level) || 0;
+    out.msg.push("机关 star=" + p.organStar + " level=" + p.organLevel);
+    return done();
+  }
+  if (head === "gm_organ_gmAddOgranItem_") {
+    gmItem(p, 30000001, Number(a.num) || 0, false, out);
+    return done();
+  }
+  if (/^SetTeamExpeditionNum_/.test(head)) {
+    p.teamExpeditionNum = Number(head.split("_")[1]) || 0;
+    out.msg.push("组队远征次数 → " + p.teamExpeditionNum);
+    return done();
+  }
+  if (/^SetClimbTowerNum_/.test(head)) {
+    p.climbTowerNum = Number(head.split("_")[1]) || 0;
+    out.msg.push("爬塔次数 → " + p.climbTowerNum);
+    return done();
+  }
+  if (head === "ModifyTime" || /^gmSetTodayTime_/.test(head)) {
+    out.msg.push("服务器时间已刷新");
+    return done();
+  }
+
+  // 剩下的（神器激活/升星/精炼、遗物、皮肤、公会、天赋树、头像等）
+  // 这版私服没做对应系统，回一句明确提示
+  out.ret = "该玩法本私服暂未开放";
+  return out;
 }
 
 // ---------------- 战斗房间（module 90） ----------------
@@ -1140,38 +1455,46 @@ function runGM(p, req) {
 // 认证通过后服务端必须主动推 90/12 StartGameP，战斗才会真正开始。
 // 主线/爬塔/挂机这类 battleType 的 getFrameSyncType() 都是 Local，
 // 也就是战场跑在客户端本地，只要 StartGameP 数据对就能打，不需要逐帧同步。
+// 抓包真实数据里每个玩家都带 109 条 builds（房间/机械的排布格子），
+// 少给会导致战场缺格子，结算后下一关进不去
+const SKIN_INFOS = [40000, 30000, 20000, 10000].map((s) => ({ skinId: s, skinLevel: 1 }));
+
+function battlePlayerInfo(p, playerId, heros, roomCode, withSkins) {
+  const o = {
+    playerId,
+    heros: heros.map((h) => deepClone(h)),
+    builds: buildList(),
+    // 官方抓包里玩家和机器人都没带 organs（没装机关），带空数组即可
+    organs: [],
+    specialCode: 0,
+    mountCode: 0,
+    goldenSkinsCount: 0,
+    support: {},
+    guildTitle: { playerIds: [], code: 0 },
+    guildDerma: { playerIds: [], code: 0 },
+  };
+  if (roomCode) o.roomCode = roomCode;
+  if (withSkins) o.skinInfos = SKIN_INFOS.map((s) => ({ ...s }));
+  return o;
+}
+
 function battleStartGameP(p, bt, lv, params) {
-  const heros = (heroList() || []).map((h) => {
-    const o = deepClone(h);
-    if (p && p.heroLevel) o.level = p.heroLevel;
-    return o;
-  });
-  const builds = [
-    // Door：Life=2，Defence=3。血量拉满，保证战场不会因为基地被打爆而秒退
-    { type: 1, attr: { 2: 1000000000, 3: 1 } },
-  ];
-  const organs = [1, 2, 3, 4, 5, 6, 7, 8].map((c) => ({
-    code: c,
-    star: c === 2 || c === 5 || c === 8 ? 4 : 1,
-    level: 1,
-    skillCode: 0,
-  }));
+  const mine = heroListOf(p);
+  // 主线是 6 人房：1 个真人 + 5 个机器人。
+  // AdvBattleRoom.initPlayerEnties 里只有 isRobot(playerId<1e5) 才会自动 setReady，
+  // 之前只给 1 个真人玩家，房间永远凑不齐队伍 → 打完一关下一关进不去、也没法开新局。
+  const players = [battlePlayerInfo(p, p.playerId, mine, 6, true)];
+  for (const id of ROBOT_IDS) players.push(battlePlayerInfo(p, id, mine, 0, false));
+
   return {
-    playerInfos: [
-      {
-        playerId: p.playerId,
-        heros,
-        builds,
-        organs,
-        identity: 1,
-      },
-    ],
-    uuid: String(Date.now()),
+    playerInfos: players,
+    // uuid 必须和 82/1 里给客户端的一致，结算 82/4 要原样回给客户端
+    uuid: p.lastBattleUuid || "b" + Date.now().toString(36),
     battleType: bt,
     level: lv,
-    battleVersion: params.get("bv") || "",
-    configVersion: params.get("cv") || "",
-    mapVersion: params.get("mv") || "",
+    battleVersion: params.get("bv") || BATTLE_VER,
+    configVersion: params.get("cv") || CONFIG_VER_BATTLE,
+    mapVersion: params.get("mv") || MAP_VER,
     adventureLevel: lv,
     mapId: 0,
   };
@@ -1299,6 +1622,28 @@ function attach(socket, gameUrl, role, params) {
   })();
 }
 
+// ---------------- 维护模式 ----------------
+// 开关存在 PHP 主机上（sy_api/state/maintenance.php），这里 10 秒缓存一次。
+// 读不到就当作没开，避免 PHP 临时抽风导致整个游戏进不去。
+let maintCache = { at: 0, on: false, msg: "" };
+async function maintStatus() {
+  if (now() - maintCache.at < 10) return maintCache;
+  let on = false;
+  let msg = "";
+  try {
+    const r = await fetch(PHP_BASE + "/maint.php?t=" + Date.now(), { headers: { accept: "application/json" } });
+    if (r.ok) {
+      const j = await r.json();
+      on = !!j.on;
+      msg = String(j.msg || "");
+    }
+  } catch (e) {
+    /* PHP 不可达时放行 */
+  }
+  maintCache = { at: now(), on, msg };
+  return maintCache;
+}
+
 // 游戏服地址：必须不带协议（客户端会自己拼 wss://，带了就变成 wss://wss//...）
 function wsUrlOf(req) {
   const u = new URL(req.url);
@@ -1343,9 +1688,11 @@ Deno.serve({ port: PORT }, async (req) => {
       } catch (e) {
         t = "fail " + e.message;
       }
-      return new Response(JSON.stringify({ ok: t.startsWith("ok"), tables: t, online: clients.size }), {
-        headers: { "content-type": "application/json; charset=utf-8" },
-      });
+      const m = await maintStatus();
+      return new Response(
+        JSON.stringify({ ok: t.startsWith("ok"), tables: t, online: clients.size, maintenance: m.on, msg: m.msg }),
+        { headers: { "content-type": "application/json; charset=utf-8" } },
+      );
     }
     // 未实现指令统计：/logs?token=xxx 直接看，用于排查某个玩法为什么点了没反应
     if (u.pathname === "/logs") {
@@ -1363,6 +1710,14 @@ Deno.serve({ port: PORT }, async (req) => {
       });
     }
     return new Response("YG private game server\n", { headers: { "content-type": "text/plain; charset=utf-8" } });
+  }
+  // 维护模式：直接拒掉 WebSocket 连接，玩家连不进对局
+  const m = await maintStatus();
+  if (m.on) {
+    return new Response("维护中：" + (m.msg || "服务器维护中"), {
+      status: 503,
+      headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" },
+    });
   }
   const { socket, response } = Deno.upgradeWebSocket(req);
   const q = new URL(req.url).searchParams;
