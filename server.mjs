@@ -565,10 +565,15 @@ function heroFull() {
   return heroFullTpl;
 }
 
-// 挂机（离线收益）基础信息：时间拉满，客户端才会显示"已满"并允许领取
+// 挂机（离线收益）基础信息
+// isGetFirstCustoms 是主城「开始挑战」按钮的开关：
+// AdventureMainCom 里 btn_adv_challenge.active = isGetFirstCoustomReward && 状态!=LOCK，
+// 之前这里写 false，11/13 回包又会 updateNewAdvInfoByInfo 覆盖掉登录推包里的 true，
+// 结果按钮被隐藏、只剩「已通关请领取奖励」，什么都点不了。
+// hangUpTime 给 0：不要一登录就弹离线收益窗
 function adventureInfo(p) {
   return {
-    level: 1,
+    level: 2,
     chapterId: 1,
     lessTimes: 0,
     buyTimes: 0,
@@ -585,11 +590,11 @@ function adventureInfo(p) {
     buyRechargeCard: false,
     levelInfos: [],
     sweepTimes: 3,
-    flushTime: 0,
+    flushTime: now(),
     infoList: [],
     storageTimes: 0,
-    isGetFirstCustoms: false,
-    hangUpTime: 43200,
+    isGetFirstCustoms: true,
+    hangUpTime: 0,
     maxHangUpTime: 43200,
   };
 }
