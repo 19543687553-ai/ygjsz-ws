@@ -976,6 +976,9 @@ function handle(conn, mod, cmd, ssid, body, ctx) {
         freeSummon: [1, 2, 6, 7, 8, 9, 10].map((t) => ({ type: t, num: 0 })),
         extractInfo: [],
         clientReward: { items: got },
+        // 抽卡动画会读 fakeReward.entites，不传的话飞卡动画直接抛
+        // TypeError: Cannot read properties of null (reading 'entites')
+        fakeReward: got,
         specialNum: 0,
         luckyNum: 0,
       });
