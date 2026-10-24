@@ -196,8 +196,11 @@ function encode(name, obj, mapDefs) {
   for (const f of fieldsOf(name)) {
     const v = obj[f.name];
     if (v === undefined || v === null) continue;
-    const md = (mapDefs || {})[name + "." + f.name];
-    encodeField(w, f, v, md || {});
+    // 必须把字段本身的类型带上：Map 的值类型就写在 f.type 上
+    // （attr: Map<uint32,uint32> → type:"uint32"），漏了会被当成字符串编码，
+    // 客户端解析 StartGameP 时会直接报「协议解析发生错误」
+    const md = Object.assign({}, f, (mapDefs || {})[name + "." + f.name] || {});
+    encodeField(w, f, v, md);
   }
   return w.result();
 }
@@ -592,7 +595,10 @@ function adventureInfo(p) {
     // 根本走不到进对局那一步。抓包真实值是 25，这里给 25。
     lessTimes: 25,
     buyTimes: 0,
-    getDt: p.createDt,
+    // getDt 是「挂机收益计时起点」，客户端 checkHangupOfflineReward 里判断
+    // 当前时间 - getDt >= 7200 就自动弹「离线收益」窗（而且这个窗没有关闭按钮）。
+    // 之前给的是账号创建时间，必然超过 2 小时 → 一登录就弹、挡死所有点击。
+    getDt: now(),
     targetList: [],
     hangUpExtendTime: 0,
     levelRewardFlag: [],
