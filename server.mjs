@@ -378,7 +378,8 @@ function defaultPlayer() {
       { code: 30000010, num: 999 },
       { code: 30000011, num: 999 },
     ],
-    guide: "",
+    // 客户端会 JSON.parse 后当字典用，必须是对象字符串，不能是纯数字
+    guide: "{}",
     guideFlag: true,
     localStorage: {},
   };
@@ -397,6 +398,8 @@ async function loadPlayer(id) {
   }
   const p = Object.assign(defaultPlayer(), saved || {});
   p.playerId = id || p.playerId || PLAYER_ID;
+  // 兼容老存档：guide 必须是 JSON 对象串（客户端会 parse 后当字典写入）
+  if (typeof p.guide !== "string" || p.guide.trim()[0] !== "{") p.guide = "{}";
   return p;
 }
 
