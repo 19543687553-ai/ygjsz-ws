@@ -398,6 +398,8 @@ function defaultPlayer() {
     guide: GUIDE_DEFAULT,
     guideFlag: false,
     localStorage: { UnlockFun: { value: "51000,5300,2201,49000", dt: 0 } },
+    // GM 改过英雄等级后记在这，23/1 回包时套用
+    heroLevel: 0,
   };
 }
 
@@ -531,6 +533,21 @@ function heroList() {
     log("[hero] 解析失败: " + e.message);
   }
   return heroTpl;
+}
+
+// 整个 23/1 回包模板，GM 改英雄等级后要重新编码
+let heroFullTpl = null;
+function heroFull() {
+  if (heroFullTpl) return heroFullTpl;
+  heroFullTpl = null;
+  const rp = REPLAY.pairs && REPLAY.pairs["23/1"];
+  if (!rp) return heroFullTpl;
+  try {
+    heroFullTpl = decode("GetHeroInfoR_Hero_S2C", Buffer.from(rp.raw, "base64"));
+  } catch (e) {
+    log("[hero] 完整包解析失败: " + e.message);
+  }
+  return heroFullTpl;
 }
 
 // 挂机（离线收益）基础信息：时间拉满，客户端才会显示"已满"并允许领取
@@ -669,7 +686,9 @@ function handle(conn, mod, cmd, ssid, body, ctx) {
 
   // 抓包里录到的真实回包优先
   const key0 = mod + "/" + cmd;
-  if (!OWN_CMDS.has(key0) && REPLAY.pairs && REPLAY.pairs[key0]) {
+  // 23/1 被 GM 改过英雄等级时要自己编码，不能直接回放旧包
+  const forceOwn = mod === 23 && cmd === 1 && p.heroLevel;
+  if (!forceOwn && !OWN_CMDS.has(key0) && REPLAY.pairs && REPLAY.pairs[key0]) {
     const rp0 = REPLAY.pairs[key0];
     conn.send(encodeS2C(mod, rp0.replyCmd, ssid, Buffer.from(rp0.raw, "base64"), rp0.comp));
     return true;
@@ -830,6 +849,22 @@ function handle(conn, mod, cmd, ssid, body, ctx) {
 
   // 英雄 module 23：升级 / 升阶等都基于抓包里的真实英雄数据
   if (mod === 23) {
+    if (cmd === 1 && p.heroLevel) {
+      const tpl = heroFull();
+      if (tpl) {
+        try {
+          const o = JSON.parse(JSON.stringify(tpl));
+          o.err = 0;
+          if (Array.isArray(o.heroList)) {
+            for (const h of o.heroList) h.level = p.heroLevel;
+          }
+          reply(2, "GetHeroInfoR_Hero_S2C", o);
+          return true;
+        } catch (e) {
+          log("[hero] GM 等级回包失败，回退原包: " + e.message);
+        }
+      }
+    }
     if (cmd === 3) {
       const list = heroList();
       const h = list.find((x) => x.uuid === (req && req.uuid)) || list[0];
@@ -877,6 +912,15 @@ function handle(conn, mod, cmd, ssid, body, ctx) {
       });
       return true;
     }
+  }
+
+  // 钱包查询 module 13：GM 改完客户端会重新拉一次，返回存档里的值
+  if (mod === 13 && cmd === 1) {
+    reply(2, "GetPlayerMoneyR_PlayerInfo_S2C", {
+      err: 0,
+      playerMoney: { money: [p.money.diamond, p.money.gold] },
+    });
+    return true;
   }
 
   // 套装 module 110
@@ -932,27 +976,91 @@ function runGM(p, req) {
   const cmd = String(req.cmd || "");
   const extra = String(req.extra || "");
   log("[GM] cmd=" + cmd + " extra=" + extra);
-  let out = "ok";
+
+  // "增加资源/添加货币/添加道具" 都是这条：rewards = [[type, code, num], ...]
+  // type 1 = 货币（code 1 金币 / 2 钻石），type 3 = 道具
+  if (cmd === "AddRewards") {
+    const a = parseExtra(extra) || {};
+    let list = a.rewards;
+    if (typeof list === "string") {
+      try {
+        list = JSON.parse(list);
+      } catch (e) {
+        list = null;
+      }
+    }
+    if (!Array.isArray(list)) return "bad rewards";
+    const parts = [];
+    for (const r of list) {
+      if (!Array.isArray(r) || r.length < 3) continue;
+      const type = Number(r[0]);
+      const code = Number(r[1]);
+      const num = Number(r[2]) || 0;
+      if (type === 1) {
+        if (code === 1) {
+          p.money.gold += num;
+          parts.push("金币+" + num);
+        } else if (code === 2) {
+          p.money.diamond += num;
+          parts.push("钻石+" + num);
+        }
+      } else if (addItem(p, code, num)) {
+        parts.push(itemName(code) + "×" + num);
+      }
+    }
+    queueSave(p);
+    return "ok " + (parts.join("，") || "无变化");
+  }
 
   if (cmd === "addItem") {
     const a = parseExtra(extra) || {};
     const code = Number(a.code || a.id || 0);
     const num = Number(a.num || a.count || 0);
-    out = addItem(p, code, num) ? "added " + code + " x" + num + " (" + itemName(code) + ")" : "bad code";
-  } else if (/^addItem_\d+/.test(extra)) {
+    return addItem(p, code, num) ? "added " + code + " x" + num + " (" + itemName(code) + ")" : "bad code";
+  }
+
+  if (cmd === "addExp") {
+    const a = parseExtra(extra) || {};
+    const num = Number(a.num || 0);
+    p.exp = (p.exp || 0) + num;
+    queueSave(p);
+    return "经验+" + num + "（总 " + p.exp + "）";
+  }
+
+  // 直接改玩家等级：setLevel_99
+  if (/^setLevel_\d+/.test(extra)) {
+    const n = Number(extra.split("_")[1]) || 1;
+    p.level = n;
+    queueSave(p);
+    return "等级 → " + n;
+  }
+
+  // 所有英雄等级：gm_hero_setAllHeroLevelGM_{ "level": 99 }
+  if (/^gm_hero_setAllHeroLevelGM_/.test(extra)) {
+    const i = extra.indexOf("{");
+    const a = i > 0 ? parseExtra(extra.slice(i)) : null;
+    const lv = a && Number(a.level);
+    if (lv) {
+      p.heroLevel = lv;
+      queueSave(p);
+      return "所有英雄等级 → " + lv;
+    }
+    return "ok";
+  }
+
+  if (/^addItem_\d+/.test(extra)) {
     const a = extra.split("_");
-    out = addItem(p, Number(a[1]), Number(a[2] || 1)) ? "added " + a[1] : "bad";
-  } else if (cmd === "adventureSkipLevel") {
+    return addItem(p, Number(a[1]), Number(a[2] || 1)) ? "added " + a[1] : "bad";
+  }
+
+  if (cmd === "adventureSkipLevel") {
     p.adventureLevel = Number(extra) || 1;
     queueSave(p);
-    out = "adventureLevel=" + p.adventureLevel;
-  } else if (cmd === "gmStr") {
-    const m = extra.match(/^([A-Za-z0-9_]+)_(\{[\s\S]*\}|.*)$/);
-    out = "gmStr:" + (m ? m[1] : extra);
-  } else {
-    out = "ok(未实现指令 " + cmd + ")";
+    return "adventureLevel=" + p.adventureLevel;
   }
-  return out;
+
+  // 其余 GM 指令（装备、神器、遗物等）本服没有对应系统，回 ok 让客户端继续
+  return "ok";
 }
 
 // ---------------- 连接 ----------------
