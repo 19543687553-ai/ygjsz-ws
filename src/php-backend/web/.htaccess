@@ -1,0 +1,21 @@
+# 站点根入口走 index.php（维护模式会在这里拦截）
+DirectoryIndex index.php index.html
+
+# 本地没有的文件回源官方 CDN（Apache）
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+
+    # sy_api 是真文件，正常走 PHP，不要进代理
+    RewriteRule ^sy_api/ - [L]
+
+    # 直接访问 /index.html 也走维护检查
+    RewriteRule ^index\.html$ index.php [L]
+
+    # 存在的文件/目录直接返回
+    RewriteCond %{REQUEST_FILENAME} -f [OR]
+    RewriteCond %{REQUEST_FILENAME} -d
+    RewriteRule ^ - [L]
+
+    # 其余全部交给 proxy.php 回源 CDN
+    RewriteRule ^(.*)$ proxy.php?p=$1 [L,QSA]
+</IfModule>

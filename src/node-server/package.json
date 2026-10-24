@@ -1,0 +1,10 @@
+{
+  "name": "ygjsz-private-server",
+  "version": "0.1.0",
+  "private": true,
+  "description": "妖怪金手指私服：HTTP + WebSocket 协议服务",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js"
+  }
+}

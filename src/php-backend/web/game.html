@@ -1,0 +1,851 @@
+<!DOCTYPE HTML>
+<html>
+
+<head>
+  <meta charset="utf-8">
+  <!-- 资源根：浏览器直连官方 CDN（跨域头是 *，比云函数代理快得多） -->
+  <!-- 必须放在所有相对 URL 之前，否则前面的 <link>/<script> 不受影响 -->
+  <base href="https://menggui-cdnres.bhsg.lintey.com/huawei/web-mobile/">
+  <script>
+    // 官方 CDN 上没有 remoteConfig / config_all 的 bin，这两类改走 PHP（带 CORS）
+    (function () {
+      var PHP_BIN = location.origin + '/sy_api/files.php?f=';
+      var NAME = /((?:preload_)?config\.hunfu147127\.bin)/;
+      function fix(u) {
+        if (typeof u !== 'string') return u;
+        var m = u.match(NAME);
+        return m ? PHP_BIN + m[1] : u;
+      }
+      var xo = XMLHttpRequest.prototype.open;
+      XMLHttpRequest.prototype.open = function (m, u) {
+        arguments[1] = fix(u);
+        return xo.apply(this, arguments);
+      };
+      if (window.fetch) {
+        var of = window.fetch;
+        window.fetch = function (input, init) {
+          if (typeof input === 'string') return of.call(window, fix(input), init);
+          if (input && input.url) return of.call(window, new Request(fix(input.url), input), init);
+          return of.call(window, input, init);
+        };
+      }
+    })();
+  </script>
+  <title></title>
+
+  <!--http://www.html5rocks.com/en/mobile/mobifying/-->
+  <meta name="viewport"
+    content="width=device-width,user-scalable=no,initial-scale=1, minimum-scale=1,maximum-scale=1" />
+
+  <!--https://developer.apple.com/library/safari/documentation/AppleApplications/Reference/SafariHTMLRef/Articles/MetaTags.html-->
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="format-detection" content="telephone=no">
+
+  <!-- force webkit on 360 -->
+  <meta name="renderer" content="webkit" />
+  <meta name="force-rendering" content="webkit" />
+  <!-- force edge on IE -->
+  <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+  <meta name="msapplication-tap-highlight" content="no">
+
+  <!-- force full screen on some browser -->
+  <meta name="full-screen" content="yes" />
+  <meta name="x5-fullscreen" content="true" />
+  <meta name="360-fullscreen" content="true" />
+
+  <!-- force screen orientation on some browser -->
+  <meta name="screen-orientation" content="portrait" />
+  <meta name="x5-orientation" content="portrait">
+
+  <!--fix fireball/issues/3568 -->
+  <!--<meta name="browsermode" content="application">-->
+  <meta name="x5-page-mode" content="app">
+
+  <!--<link rel="apple-touch-icon" href=".png" />-->
+  <!--<link rel="apple-touch-icon-precomposed" href=".png" />-->
+  <link href="style-mobile.931a5.css" rel="stylesheet" type="text/css">
+
+  <!-- 私服日志上报：抓控制台报错 + 统计哪些协议指令没有回包 -->
+  <script>
+    (function () {
+      var URL = location.origin + "/sy_api/log.php";
+      var buf = [], sending = false;
+
+      // 资源脚本都走 CDN（带 allow-origin: *），加上 crossorigin 后
+      // window.onerror 才能拿到完整堆栈，而不是只有 "Script error."
+      try {
+        var ce = document.createElement.bind(document);
+        document.createElement = function (tag) {
+          var el = ce(tag);
+          if (String(tag).toLowerCase() === "script") {
+            try { el.crossOrigin = "anonymous"; } catch (e) { }
+          }
+          return el;
+        };
+      } catch (e) { }
+      function push(lv, m) {
+        if (buf.length > 300) buf.shift();
+        buf.push({ lv: lv, m: String(m).slice(0, 1500) });
+      }
+      function flush() {
+        if (!buf.length || sending) return;
+        sending = true;
+        var body = JSON.stringify({ t: Date.now(), url: location.href, logs: buf.splice(0, 40) });
+        var x = new XMLHttpRequest();
+        x.open("POST", URL, true);
+        x.setRequestHeader("Content-Type", "application/json");
+        x.onloadend = function () { sending = false; };
+        x.onerror = x.onloadend;
+        try { x.send(body); } catch (e) { sending = false; }
+      }
+      setInterval(flush, 5000);
+      window.addEventListener("beforeunload", flush);
+
+      ["log", "warn", "error"].forEach(function (lv) {
+        var old = console[lv];
+        console[lv] = function () {
+          try {
+            var s = [];
+            for (var i = 0; i < arguments.length; i++) {
+              var a = arguments[i];
+              if (typeof a === "string") s.push(a);
+              else { try { s.push(JSON.stringify(a)); } catch (e) { s.push(String(a)); } }
+            }
+            push(lv, s.join(" "));
+          } catch (e) { }
+          try { old.apply(console, arguments); } catch (e) { }
+        };
+      });
+      window.onerror = function (msg, src, line, col, err) {
+        push("error", "[onerror] " + msg + " @" + (src || "").split("/").pop() + ":" + line + (err && err.stack ? " " + err.stack : ""));
+      };
+      window.addEventListener("unhandledrejection", function (e) {
+        push("error", "[reject] " + ((e.reason && (e.reason.stack || e.reason.message)) || e.reason));
+      });
+
+      // WebSocket 指令统计：发出去 8 秒没回包的记下来，方便定位哪个功能没人实现
+      function hexOf(d) {
+        if (typeof d === "string") return d;
+        if (d && typeof d.byteLength === "number") {
+          var u = new Uint8Array(d), s = "";
+          for (var i = 0; i < Math.min(u.length, 9); i++) s += (u[i] < 16 ? "0" : "") + u[i].toString(16);
+          return s;
+        }
+        return null;
+      }
+      var pending = {};
+      var Native = window.WebSocket;
+      if (Native) {
+        function Wrapped(url, p) {
+          var ws = p ? new Native(url, p) : new Native(url);
+          ws.addEventListener("message", function (ev) {
+            try {
+              var h = hexOf(ev.data);
+              if (h && h.length >= 18) {
+                var mod = parseInt(h.substr(10, 2), 16);
+                var cmd = parseInt(h.substr(12, 4), 16);
+                delete pending[mod + "/" + (cmd - 1)];
+              }
+            } catch (e) { }
+          });
+          var raw = ws.send;
+          ws.send = function (d) {
+            try {
+              var h = hexOf(d);
+              if (h && h.length >= 12) {
+                var mod = parseInt(h.substr(4, 2), 16);
+                var cmd = parseInt(h.substr(6, 4), 16);
+                pending[mod + "/" + cmd] = Date.now();
+              }
+            } catch (e) { }
+            return raw.apply(ws, arguments);
+          };
+          return ws;
+        }
+        Wrapped.prototype = Native.prototype;
+        ["CONNECTING", "OPEN", "CLOSING", "CLOSED"].forEach(function (k) { if (Native[k] !== undefined) Wrapped[k] = Native[k]; });
+        window.WebSocket = Wrapped;
+        setInterval(function () {
+          var now = Date.now(), miss = [];
+          for (var k in pending) {
+            if (now - pending[k] > 8000) { miss.push(k); delete pending[k]; }
+          }
+          if (miss.length) push("warn", "[无回包] module/cmd " + miss.join(", "));
+        }, 8000);
+      }
+    })();
+  </script>
+
+  <!--other_libs_files_start-->
+  <!-- <script src="jslibs/clipboard.min.js"></script> -->
+  <!--<script src="jslibs/jquery.2.min.js"></script>-->
+  <!-- 私服 SDK 桩：内联，避免被 <base> 改写到资源代理域名 -->
+  <script>
+    (function () {
+      var DEV_UID = 'dev_' + Date.now();
+      window._h5_platform = {
+        init: function () {},
+        login: function (cb) { cb({ err: 0, uid: DEV_UID, token: 'dev_token', ext: { channel_id: '282', game_channel_id: '7158', game_id: '191', game_name: '妖怪金手指', game_ver: '1.0.0.0' } }); },
+        switchAccount: function () {}, purchase: function () {},
+        gameReport: function (d, cb) { if (cb) cb(); },
+        share: function (d, cb) { if (cb) cb(); },
+        getOsCode: function () { return 2; },
+        cmd: function (d, cb) { if (cb) cb({}); },
+        restart: function () { location.reload(); },
+        exitGame: function () { location.reload(); },
+        loadAds: function (d, cb) { if (cb) cb(); },
+        showAds: function (d, cb) { if (cb) cb(3); },
+        canIUse: function () { return true; },
+        getAdsIcon: function () { return 'resources/ui/common/common_frame/common_img_luxiang'; },
+        nodeRecord: function () {}, openKefu: function () {}
+      };
+    })();
+  </script>
+</head>
+
+<body onload="fetchAgent()">
+  <canvas id="GameCanvas" oncontextmenu="event.preventDefault()" tabindex="0"></canvas>
+  <div id="splash" class="stripes">
+    <div class="progress">
+      <div id="loadingBar" class="progress-bar progress-bar-info" style="width: 100%;">
+        <div class="progress-value">
+          <!-- <img class="shake-div" src="./loading_role.c2257.png" style="height: 40px;"></img> -->
+        </div>
+      </div>
+    </div>
+    </div>
+  </div>
+
+  <!-- <script src="jquery-3.6.0.min.js" type="text/javascript"></script> -->
+  <script>
+    var now = Date.now();
+    var manifestJson = {};
+    var localConfig = {"AgentCode": "huawei", "PaySerever": "https://menggui-api.bhsg.lintey.com/sy_pay/huawei_pay.php", "__KEY": "h5", "__SDKGameUrl": "https://zeus.aidalan.com/v1/H5Game?game_id=191&channel_id=282&game_channel_id=7158&add_desktop=1&direction=2", "__serverKEY": "huawei", "clientType": 1, "h5SBFileName": "h5SB_dalan.js", "indexHtmlFile": "indexRelease.html", "useThirdSystem": 1, "DataBinPath": "config_all/hunfu", "HttpSerever": "menggui-api.bhsg.lintey.com/sy_api/game_api.php", "Project": "td", "PtId": 4, "ServerName": "\u5927\u84dd\u534e\u4e3a\u4e13\u670d", "DistTime": "20261023 06:21:12", "ClientVer": "147192", "ConfigVer": "147127", "BuildTime": "20261023 06:08:49"}
+    // 私服：接口地址不带协议（下面的 ajax 会自己补 https://）
+    localConfig.HttpSerever = location.host + "/sy_api/game_api.php";
+    localConfig.PaySerever = location.host + "/sy_api/pay.php";
+    console.log('[私服] 接口地址', localConfig.HttpSerever);
+    var remoteConfig = {}
+    var urlKV = {};
+
+    console.log('>========localConfig===========<')
+    console.log(localConfig)
+    console.log('>===================<')
+
+    function formatParams(data) {
+      var arr = [];
+      for (var name in data) {
+        arr.push(encodeURIComponent(name) + "=" + encodeURIComponent(data[name]));
+      }
+      arr.push(("v=" + Math.random()).replace(".", ""));
+      return arr.join("&");
+    }
+    function ajaxGet(url, query, succCb, failCb, isJson) {
+      if (query) {
+        var parms = formatParams(query);
+        url += '?' + parms;
+      }
+
+      var ajax = new XMLHttpRequest();
+      ajax.open("GET", url, true);
+
+      ajax.send(null);
+
+      ajax.onreadystatechange = function () {
+        if (ajax.readyState === 4) {
+          if (ajax.status === 200) {
+            if (isJson === undefined) {
+              isJson = true;
+            }
+            var res = isJson ? JSON.parse(ajax.responseText == "" ? '{}' : ajax.responseText) : ajax.responseText;
+            succCb && succCb(res);
+          } else {
+            failCb && failCb();
+          }
+        }
+      }
+    }
+
+
+    function fetchAgent() {
+      this.startLoadSingle();
+      this.startProgress();
+      let host = localConfig.HttpSerever.replace("game_api", "get_versionInfoApi")
+
+      let params = {
+        "code": localConfig.JSVer || "1",
+        "pt_id": localConfig.PtId || "0",
+      }
+      params["plat" + "form"] = localConfig.__serverKEY + "_" + localConfig.__KEY
+      ajaxGet(getProtocolPrefix() + host, params, (res) => {
+        console.log("load agent", res)
+        remoteConfig = res.data
+
+        const testData = JSON.parse(remoteConfig['checkConfig'])
+        if (!Array.isArray(testData)) {
+          console.warn("后台数据结构异常，尝试修正", testData)
+          var newData = []
+          for (let key in testData) {
+            newData.push(testData[key])
+          }
+          remoteConfig['checkConfig'] = JSON.stringify(newData)
+          console.warn("修正后", remoteConfig['checkConfig'])
+        }
+
+        {
+          const testData = JSON.parse(remoteConfig['checkConfig'])
+          if (!Array.isArray(testData)) {
+            console.warn("后台数据结构异常，修正失败", testData)
+          }
+        }
+
+        // 关闭新手引导。客户端登录时会 getPerformConfig(CloseGuide) 决定 switchGuideEnable(!v)。
+        // 引导开着时打完第一关会弹 GuideView：它的角色骨骼没初始化，会抛
+        // "Cannot read properties of undefined (reading 'play')"，同时引导目标宽高为 0 指不到位置，
+        // 而引导的全屏遮挡会吃掉所有点击 -> 表现就是“什么也玩不了”。
+        // 这里在前端兜底一遍，就算线上的 get_versionInfoApi.php 还是旧版也能生效。
+        try {
+          var cfgArr = JSON.parse(remoteConfig['checkConfig']).filter(function (s) {
+            return String(s).indexOf('CloseGuide') !== 0;
+          })
+          cfgArr.push('CloseGuide:1')
+          remoteConfig['checkConfig'] = JSON.stringify(cfgArr)
+        } catch (e) {
+          console.warn("强制关闭引导失败", e)
+        }
+
+        nodeRecord(1);
+        console.log('>========remoteConfig===========<')
+        console.log(remoteConfig)
+        console.log('>===================<')
+
+        ready()
+      })
+
+      // var xhr = new XMLHttpRequest();
+      // xhr.open('GET', getProtocolPrefix() + host, true);
+      // xhr.addEventListener("load", function () {
+      //   localConfig = JSON.parse(xhr.response);
+
+      //   nodeRecord(1);
+      //   console.log('>===================<')
+      //   console.log(localConfig)
+      //   console.log('>===================<')
+
+      //   ready()
+      // })
+      // xhr.send(null);
+    }
+
+    /**
+     * @description: 动态设置背景
+     */
+    function setBackground() {
+      // 根据配置设置背景
+      if(!remoteConfig.checkConfig || !remoteConfig.checkConfig.includes('StaticTheme')) return
+
+      var checkConfigObj = JSON.parse(remoteConfig.checkConfig)
+      for(let cfg of checkConfigObj) {
+        if(cfg.indexOf('StaticTheme') == 0){
+          // 可以通过 remoteConfig 或其他条件动态设置背景
+          var keys = cfg.split(':')[0].replace('StaticTheme', '').split('_')
+          var times = JSON.parse(cfg.split(':')[1])
+          var now = Math.floor(Date.now()/1000)
+          var index = keys[0]
+          var resVer = keys[1]
+          if (now >= times[0] && now < times[1]){
+            var bgElement = document.body;
+            var bgConfig = `jzjm_bg_ditu_theme${index}.${resVer}.png`
+            bgElement.style.backgroundImage = 'url(' + bgConfig + ')';
+            urlKV["StaticTheme"] = Number(index)
+            break
+          }
+        }
+      }
+
+      if (urlKV["StaticTheme"] == undefined) {
+        var bgElement = document.body;
+        bgElement.style.backgroundImage = 'url(jzjm_bg_ditu.70898.jpg)';
+      }
+    }
+
+    function ready() {
+      parseUserAgent();
+
+      // 动态设置背景
+      setBackground();
+
+      loadSingleScript('manifest.' + (remoteConfig['JSVer'] || localConfig['ClientVer']) + '.js', function () {
+        manifestJson = window.manifest
+        if (_h5_platform)
+          _h5_platform.init()
+
+        var list = manifestJson.initial.concat(manifestJson.game);
+
+        var checkConfigObj = JSON.parse(remoteConfig.checkConfig)
+        if (checkConfigObj.indexOf("LogOpen:1") != -1) {
+          list = list.concat(manifestJson.debug);
+        }
+
+        var total = list.length
+        var nodeRecordDone = false
+        loadScript(list, function () {
+          nodeRecord(3);
+          // this.setProgressEnd(function () {
+          // open web debugger console
+          if ($platform_id == 4 || $platform_id == 5) {
+            if (typeof VConsole !== 'undefined') {
+              window.vConsole = new VConsole();
+            }
+          }
+          window.boot();
+          // })
+        })
+      })
+    }
+
+    // var uiWidth = 720;
+    // var uiHeight = 1280;
+    // var loadingUi = document.getElementById('loadingUi');
+    // var lbar = document.getElementById('loadingBar');
+    // var loadingBarTips = document.getElementById("loadingBarTips");
+    // var warningTips = document.getElementById("warningTips");
+
+    // lbar.style.width = "0%";
+
+    // var _resIsInit = false;
+    // var _progress = 0;
+    // var _lastProgressValue = -1;
+    // var _completeDelayTime = 0;
+    // var _lastTime = -1;
+    // var _isDone = false;
+    // var _doneCallback;
+    // var _timerId = 0;
+    // var _funnyTipTimeId = 0;
+    // var _curFunnyTip = "";
+
+    // const FakerSpeed = 0.35;
+    // const CompleteDelayTime = 0.3;
+    // const FixRate = 0.85;
+    // const FunnyTipSwitchTime = 2500;
+
+    // const FUNNY_TIPS = [
+    //   "准备结束...",
+    //   "正在喂战马粮草...",
+    //   "正在为战马梳理毛发...",
+    //   "正在整理护甲...",
+    //   "正在打磨武器...",
+    //   "正在制作战令...",
+    //   "正在召集武将...",
+    // ]
+
+    function clamp(value, min, max) {
+      return Math.max(Math.min(value, max), min);
+    }
+
+    function setProgressEnd(callback) {
+      // this._doneCallback = callback;
+      // this._isDone = true;
+    }
+
+    /**
+     * @description: 开始进度条动画
+     */
+    function startProgress() {
+      // this._lastTime = 0;
+      // this._progress = 0;
+      // this._isDone = false;
+      // this._lastProgressValue = -1;
+      // this._completeDelayTime = CompleteDelayTime;
+
+      // this.getPassTime();
+      // this.startFunnyTip();
+      // this.startFrameTimer();
+
+      // lbar.style.width = "0%";
+    }
+
+    /**
+     * @description: 停止进度条动画
+     */
+    function stopProgress() {
+      this._lastTime = 0;
+      this.stopFrameTimer();
+      this.funnyTipEnd();
+      let callback = this._doneCallback;
+      this._doneCallback = null;
+      if (callback != null) {
+        callback();
+      }
+    }
+
+    /**
+     * @description: 启动帧计时器
+     */
+    function startFrameTimer() {
+      if (this._timerId > 0) {
+        return;
+      }
+
+      this._timerId = setInterval(frameHandler, 1000 / 30);
+    }
+
+    /**
+     * @description: 停止帧计时器
+     */
+    function stopFrameTimer() {
+      if (this._timerId > 0) {
+        clearInterval(this._timerId);
+        this._timerId = 0;
+      }
+    }
+
+    /**
+     * @description: 帧响应
+     */
+    function frameHandler() {
+      let passTime = this.getPassTime();
+      if (passTime <= 0)
+        return;
+
+      if (!this._isDone) {
+        let fakerLeftProgress = this.clamp(FixRate - this._progress, 0, 1);
+        let speed = this.clamp(passTime * (fakerLeftProgress * FakerSpeed), 0, 1);
+
+        this._progress += speed;
+        this.updateProgress(this._progress);
+      } else {
+        this.funnyTipEnd();
+
+        if (this._progress <= 1) {
+          this._progress = 1;
+          this.updateProgress(this._progress);
+        }
+
+        this._completeDelayTime -= passTime;
+        if (this._completeDelayTime < 0) {
+          this.stopProgress();
+        }
+      }
+    }
+
+    function updateProgress(rate) {
+      rate = this.clamp(rate, 0, 1);
+      let toRate = 100 * rate;
+      lbar.style.width = toRate + "%";
+
+      let pValue = Math.floor(rate * 10000)
+      if (this._lastProgressValue != pValue) {
+        this._lastProgressValue = pValue;
+        pValue /= 100;
+        let left = Math.floor(pValue);
+        let right = Math.floor((left > 0 ? pValue % left : pValue) * 100);
+        let leftStr = left.toString();
+        let rigthStr = right.toString();
+        while (leftStr.length < 2) {
+          leftStr = "0" + leftStr;
+        }
+        while (rigthStr.length < 2) {
+          rigthStr = rigthStr + "0";
+        }
+        loadingBarTips.innerHTML = this._curFunnyTip + "(" + leftStr + "." + rigthStr + "%)";
+      }
+    }
+
+    function getNow() {
+      return new Date().getTime() / 1000;
+    }
+
+    function getPassTime() {
+      if (this._lastTime <= 0) {
+        this._lastTime = this.getNow();
+        return 0;
+      }
+
+      let now = this.getNow();
+      let passTime = now - this._lastTime;
+      this._lastTime = now;
+
+      return passTime;
+    }
+
+    function startFunnyTip() {
+      this.clearFunnyTipTimer();
+      this.updateRandomFunTip();
+      this._funnyTipTimeId = setInterval(this.updateRandomFunTip, FunnyTipSwitchTime);
+    }
+
+    function updateRandomFunTip() {
+      let len = Math.max(1, FUNNY_TIPS.length - 1);
+      let pos = this.getRandomInt(1, len);
+      this._curFunnyTip = FUNNY_TIPS[pos];
+    }
+
+    function clearFunnyTipTimer() {
+      if (this._funnyTipTimeId > 0) {
+        clearInterval(this._funnyTipTimeId);
+        this._funnyTipTimeId = 0;
+      }
+    }
+
+    function funnyTipEnd() {
+      if (this._funnyTipTimeId > 0) {
+        clearInterval(this._funnyTipTimeId);
+        this._funnyTipTimeId = 0;
+        this._curFunnyTip = FUNNY_TIPS[0];
+      }
+    }
+
+    function getRandomInt(min, max) {
+      min = Math.ceil(min);
+      max = Math.floor(max);
+      return Math.floor(Math.random() * (max - min + 1)) + min; //The maximum is exclusive and the minimum is inclusive
+    }
+
+    var loadDelayId;
+    function startLoadSingle() {
+      // if (loadingUi.style.display == 'none') {
+      //   var _scaleY = Math.min(window.innerWidth / uiWidth, 1);
+      //   var _scaleX = _scaleY;
+      //   var _topY = (window.innerHeight - uiHeight * _scaleY) / 2;
+      //   var _leftX = (window.innerWidth - uiWidth * _scaleX) / 2;
+
+      //   loadingUi.style.width = uiWidth;
+      //   loadingUi.style.height = uiHeight;
+      //   loadingUi.style.border = 'none';
+      //   loadingUi.style.left = _leftX + 'px';
+      //   loadingUi.style.top = _topY + 'px';
+      //   loadingUi.style.webkitTransform = 'scale(' + _scaleX + ',' + _scaleY + ')';
+      //   loadingUi.style.display = 'block';
+      // }
+
+      // if (loadDelayId > 0) {
+      //   clearTimeout(loadDelayId);
+      //   loadDelayId = 0;
+      // }
+      // loadDelayId = setTimeout(function () {
+      //   warningTips.innerHTML = "<a style='color:#1048CE' href='javascript:void(0)'' onclick='window.location.reload()'>若加载不成功，请点此刷新游戏。</a>";
+      //   loadDelayId = 0;
+      // }, 30000);
+    }
+
+    function loadScript(list, callback, eachCB) {
+      var loaded = 0;
+      var loadNext = function () {
+        eachCB && eachCB(loaded + 1)
+        loadSingleScript(list[loaded], function () {
+          loaded++;
+          if (loaded >= list.length) {
+            callback();
+          }
+          else {
+            loadNext();
+          }
+        })
+      };
+      loadNext();
+    };
+
+    function loadSingleScript(src, callback) {
+      var s = document.createElement('script');
+      s.async = false;
+      s.src = src;
+      s.addEventListener('load', function () {
+        s.parentNode.removeChild(s);
+        s.removeEventListener('load', arguments.callee, false);
+        callback();
+      }, false);
+      document.body.appendChild(s);
+    };
+
+    /**复制文本到剪切板*/
+    function copyToClipBoard(str, doneCB) {
+      console.log('copyToClipBoard', str)
+      document.getElementById('clipboardPanel').style.display = 'block';
+      var clipboard = new Clipboard('.clipboardBtn', {
+        text: function (trigger) {
+          return str;
+        }
+      });
+
+      clipboard.on('success', function (e) {
+        console.log(e);
+        document.getElementById('clipboardPanel').style.display = 'none';
+        doneCB('success')
+        clipboard.destroy();
+      });
+      clipboard.on('error', function (e) {
+        console.log(e);
+        document.getElementById('clipboardPanel').style.display = 'none';
+        doneCB('error')
+        clipboard.destroy();
+      });
+    }
+
+
+    var $platform_id = 6;//（默认）
+    var $browser_id = 0;
+    function parseUserAgent() {
+      var ua = navigator.userAgent;
+      var isAndroid = (/Android|HTC/i.test(ua) || !!(window.navigator['platform'] + '').match(/Linux/i));
+      var isIpad = !isAndroid && /iPad/i.test(ua);
+      var isIphone = !isAndroid && /iPod|iPhone/i.test(ua);
+      var isIOS = isIpad || isIphone;
+      var isWindows = /Windows NT|Windows ME|Windows 98/i.test(ua);
+      var isLinux = !isAndroid && /Linux/i.test(ua);
+      var isMac = !isIOS && /Mac OS X/i.test(ua);
+
+      if (isWindows) {
+        //Windows 桌面平台
+        $platform_id = 1;
+      } else if (isMac) {
+        //Mac 桌面平台
+        $platform_id = 2;
+      } else if (isLinux) {
+        //Linux 桌面平台
+        $platform_id = 3;
+      } else if (isIOS) {
+        //IOS 手机平台
+        $platform_id = 4;
+        var isLongIPhone = /iphone/gi.test(window.navigator.userAgent) && window.screen.height / window.screen.width > 16 / 9;
+        console.log('isLongIPhone', isLongIPhone, window.screen.height, window.screen.width);
+        if (isLongIPhone) {
+          urlKV["statusBarHeight"] = 0
+          urlKV["statusBottomHeight"] = 5
+        }
+      } else if (isAndroid) {
+        //android 手机平台
+        $platform_id = 5;
+      }
+
+      if (/TencentTraveler|QQBrowser/.test(ua)) {
+        //QQ浏览器
+        $browser_id = 1;
+      } else if (/MicroMessenger/.test(ua)) {
+        //微信浏览器
+        $browser_id = 2;
+      } else if (/Chrome/.test(ua) || (/Android/.test(ua) && /Linux/.test(ua) && /Mobile Safari/.test(ua))) {
+        //chrome 浏览器
+        $browser_id = 5;
+      } else if (/Safari/.test(ua)) {
+        //safari 浏览器
+        $browser_id = 6;
+      } else if (/MSIE/.test(ua) && /Maxthon|The world|360SE|TencentTraveler|SE|Avant/.test(ua) == false) {
+        //IE浏览器
+        $browser_id = 4;
+      } else if (/Android/.test(ua)) {
+        //安卓原生浏览器
+        $browser_id = 3;
+      }
+    }
+
+    /**点统计*/
+    function nodeRecord(k, v) {
+      if (_h5_platform)
+        _h5_platform.nodeRecord(k, v)
+    }
+
+    function isHttps() {
+      if (document && document.location && document.location.protocol) {
+        return document.location.protocol == "https:" ? true : false
+      }
+    }
+
+    function getProtocolPrefix() {
+      if (isHttps()) {
+        return "https://"
+      } else {
+        return "http://"
+      }
+    }
+
+    function checkUrl(url) {
+      let regex = /^http(s)?:\/\/[\w\-]+(\.[\w\-]+)+([\w\-.,@?^=%&:\/~+#]*[\w\-@?^=%&\/~+#])?$/;
+      return regex.test(url)
+    }
+
+    function getLocalAgent() {
+      return localConfig
+    }
+
+    function getRemoteAgent() {
+      return remoteConfig
+    }
+
+    /**获取链接键值对*/
+    function getUrlKV() {
+      return urlKV
+    }
+
+    function parseURL() {
+      var href = decodeURI(window.location.href);
+      console.log("========>", href);
+      var keyValueStr = href.split("?")[1];
+      if (keyValueStr && keyValueStr != "") {
+        var keyValues = keyValueStr.split("&");
+        console.log("========>", keyValues);
+        for (var i in keyValues) {
+          var keyValue = keyValues[i].split("=");
+          // var key = keyValue[0];
+          // var value = keyValue[1];
+          urlKV[keyValue[0]] = keyValue[1];
+        }
+      }
+      console.log("========>", urlKV);
+    }
+
+  </script>
+
+  <!-- 私服兜底：只处理会卡住主界面的两个东西
+       1) 离线收益弹窗（没有完整服务端数据时关不掉）
+       2) 新手引导容器和残留的 dark 遮罩（会吞掉全屏点击）
+       注意 1：绝不能按 "reward" 关键字大范围隐藏，抽卡/关卡结算的奖励窗名字里也有 reward，
+               那样抽完卡会看不到结果，看起来就像“抽奖没反应”；
+       注意 2：也不能用 "hangup" + "reward" 组合匹配 —— 抽卡结果窗里的奖励卡片节点就叫
+               hangup_reward_comp / n_hangup_reward，一起隐藏会让奖励卡直接消失。
+               所以这里只认窗口名 hangupoffline。 -->
+  <script>
+    (function () {
+      var done = "";
+      setInterval(function () {
+        try {
+          var cc = window.cc;
+          if (!cc || !cc.director || !cc.director.getScene) return;
+          var scene = cc.director.getScene();
+          if (!scene) return;
+          var hit = [];
+          (function walk(n) {
+            if (!n) return;
+            var low = (n.name || "").toLowerCase();
+            if (low.indexOf("hangupoffline") >= 0) {
+              hit.push(n);
+            }
+            // Guide 是引导容器本身，只关子节点的话容器上的全屏拦截还在
+            if (low === "guide" && n.active) n.active = false;
+            // 孤立的 dark 遮罩（兄弟窗口都关了它还留着）会吞掉所有点击
+            if (low === "dark" && n.active) {
+              var p = n.parent, k = p ? (p.children || []) : [], alive = 0;
+              for (var i = 0; i < k.length; i++) if (k[i] !== n && k[i].active) alive++;
+              if (!alive) n.active = false;
+            }
+            var kids = n.children || [];
+            for (var i = 0; i < kids.length; i++) walk(kids[i]);
+          })(scene);
+          // 只能隐藏，不能 destroy：客户端随后还会调用窗口上的方法，
+          // 销毁后就是 "Cannot read properties of null (reading 'showHangUpReward')"
+          for (var i = 0; i < hit.length; i++) {
+            hit[i].active = false;
+          }
+          var names = hit.map(function (x) { return x.name; }).join(",");
+          if (names && names !== done) {
+            done = names;
+            console.log("[私服] 已关闭卡住的弹窗: " + names);
+          }
+        } catch (e) { }
+      }, 1200);
+    })();
+  </script>
+</body>
+
+</html>

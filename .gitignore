@@ -1,0 +1,7 @@
+node_modules/
+chromeprof_*/
+*.log
+sy_api/state/*
+!sy_api/state/.keep
+__pycache__/
+*.idsig

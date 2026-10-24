@@ -5,7 +5,7 @@ import { Buffer } from "node:buffer";
 
 // ---------------- 配置 ----------------
 const PHP_BASE = (Deno.env.get("PHP_BASE") || "https://zx.lytnb.top/sy_api").replace(/\/+$/, "");
-const TOKEN = Deno.env.get("TOKEN") || "yg_9f3c1a7b_change_me";
+const TOKEN = Deno.env.get("TOKEN") || "CHANGE_ME_请替换成自己的token";
 const PLAYER_ID = Number(Deno.env.get("PLAYER_ID") || 0) || 67820771;
 const SAVE_DELAY = 800; // 毫秒，改档后延迟合并写入
 const PORT = Number(Deno.env.get("PORT") || 8000);
