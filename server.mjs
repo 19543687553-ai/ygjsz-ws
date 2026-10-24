@@ -145,7 +145,9 @@ function encodeField(w, f, v, def) {
       // 老存档可能只存了字符串，这里自动补成 {value, dt}
       const valRef = def.valRef || def.ref;
       const valIsObj = def.valType === "object" || (!def.valType && !!valRef);
-      const valType = def.valType || (valIsObj ? "object" : "string");
+      // Map 的值类型在 schema 里写在 type 上（如 attr: Map<uint32,uint32> → type:"uint32"），
+      // 以前一律当字符串编，英雄/建筑的属性表会对不上
+      const valType = def.valType || (valIsObj ? "object" : def.type && def.type !== "object" ? def.type : "string");
       // key 类型：schema 只写了值类型，数字 key（如英雄 attr Map<uint32,uint32>）要编成 varint，
       // 字符串 key（如 localStorage 的 UnlockFun）要编成 bytes，按实际 key 判断
       const keyType = def.keyType ||
@@ -186,6 +188,16 @@ function encode(name, obj, mapDefs) {
     encodeField(w, f, v, md || {});
   }
   return w.result();
+}
+
+// 解码后的 int64 是 BigInt，JSON.parse(JSON.stringify()) 会直接抛错，
+// 自己写一个深拷贝，BigInt 原样保留
+function deepClone(o) {
+  if (o === null || typeof o !== "object") return o;
+  if (Array.isArray(o)) return o.map(deepClone);
+  const r = {};
+  for (const k of Object.keys(o)) r[k] = deepClone(o[k]);
+  return r;
 }
 
 function readVarint(buf, pos) {
@@ -290,15 +302,18 @@ function readMapEntry(buf, md) {
   while (pos.i < buf.length) {
     const k = Number(readVarint(buf, pos));
     const tag = k >> 3;
-    if (tag === 1) key = decodeScalar(buf, pos, md.keyType || "string");
+    const wire = k & 7;
+    // Map 的 key 没有 schema 说明类型，只能看 wire type：
+    // 0 = varint（Map<uint32,uint32> 的数字 key），2 = 字符串
+    if (tag === 1) key = wire === 0 ? String(readVarint(buf, pos)) : decodeScalar(buf, pos, "string");
     else if (tag === 2) {
       const vRef = md.valRef || md.ref;
-      if (md.valType === "object" || (!md.valType && vRef)) val = decode(vRef, readBytes(buf, pos), null);
-      else val = decodeScalar(buf, pos, md.valType || "string");
+      if (vRef) val = decode(vRef, readBytes(buf, pos), null);
+      else val = wire === 0 ? readVarint(buf, pos) : decodeScalar(buf, pos, "string");
     } else {
-      if ((k & 7) === 0) readVarint(buf, pos);
-      else if ((k & 7) === 2) readBytes(buf, pos);
-      else if ((k & 7) === 1) pos.i += 8;
+      if (wire === 0) readVarint(buf, pos);
+      else if (wire === 2) readBytes(buf, pos);
+      else if (wire === 1) pos.i += 8;
       else pos.i += 4;
     }
   }
@@ -488,7 +503,7 @@ function commonTemplateOf() {
 function buildCommonInfo(p) {
   const tpl = commonTemplateOf();
   if (!tpl) return legacyCommonInfo(p);
-  const o = JSON.parse(JSON.stringify(tpl));
+  const o = deepClone(tpl);
   o.playerItem = o.playerItem || {};
   o.playerItem.err = 0;
   o.playerItem.items = p.items.map((it) => ({
@@ -779,13 +794,25 @@ function handle(conn, mod, cmd, ssid, body, ctx) {
   // 战斗房间 module 82 (Build)
   if (mod === 82) {
     if (cmd === 1) {
+      // 以前 addr 指向游戏服自己、authCode 是写死的假值，
+      // 客户端连上去后没人处理 90/Auth，也收不到 StartGameP，所以永远进不了对局。
+      // 现在把 addr 指到本服务的战斗房间通道（?role=battle），由 handleBattle 接手。
+      const bt = req ? Number(req.battleType) || 0 : 0;
+      const lv = req ? Number(req.level) || 1 : 1;
+      const auth = "yg" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+      const host = String(ctx.gameUrl || "").replace(/\/+$/, "");
+      const vs = req
+        ? "&bv=" + encodeURIComponent(req.battleVersion || "") +
+          "&cv=" + encodeURIComponent(req.configVersion || "") +
+          "&mv=" + encodeURIComponent(req.mapVersion || "")
+        : "";
       reply(2, "EnterRoomR_Build_S2C", {
         err: 0,
-        authCode: "dev_auth",
-        addr: ctx.gameUrl,
-        battleType: req ? req.battleType : 0,
-        pingInterval: 5,
-        frameInterval: 10,
+        authCode: auth,
+        addr: host + "/ws?role=battle&auth=" + auth + "&bt=" + bt + "&lv=" + lv + vs,
+        battleType: bt,
+        pingInterval: 40,
+        frameInterval: 30,
       });
       return true;
     }
@@ -853,7 +880,7 @@ function handle(conn, mod, cmd, ssid, body, ctx) {
       const tpl = heroFull();
       if (tpl) {
         try {
-          const o = JSON.parse(JSON.stringify(tpl));
+          const o = deepClone(tpl);
           o.err = 0;
           if (Array.isArray(o.heroList)) {
             for (const h of o.heroList) h.level = p.heroLevel;
@@ -869,7 +896,7 @@ function handle(conn, mod, cmd, ssid, body, ctx) {
       const list = heroList();
       const h = list.find((x) => x.uuid === (req && req.uuid)) || list[0];
       if (h) {
-        const up = JSON.parse(JSON.stringify(h));
+        const up = deepClone(h);
         up.level = (up.level || 1) + 1;
         up.fightCap = Math.round((up.fightCap || 0) * 1.2);
         reply(4, "HeroUpGradeR_Hero_S2C", { err: 0, hero: up });
@@ -880,7 +907,7 @@ function handle(conn, mod, cmd, ssid, body, ctx) {
       const list = heroList();
       const h = list.find((x) => x.uuid === (req && req.uuid)) || list[0];
       if (h) {
-        const up = JSON.parse(JSON.stringify(h));
+        const up = deepClone(h);
         if (cmd === 5) up.section = (up.section || 0) + 1;
         else up.crown = (up.crown || 0) + 1;
         up.fightCap = Math.round((up.fightCap || 0) * 1.2);
@@ -893,7 +920,16 @@ function handle(conn, mod, cmd, ssid, body, ctx) {
   // 抽卡 module 26
   if (mod === 26) {
     if (cmd === 1) {
-      reply(2, "GetSearchSummonInfoR_SearchSummon_S2C", { err: 0 });
+      // freeSummon / extractInfo / wishInfo 不传的话客户端拿不到免费次数，
+      // 抽卡界面会“点了没反应”，这里把每种卡池的免费次数都置 0（都可免单一次）
+      reply(2, "GetSearchSummonInfoR_SearchSummon_S2C", {
+        err: 0,
+        freeSummon: [1, 2, 6, 7, 8, 9, 10].map((t) => ({ type: t, num: 0 })),
+        extractInfo: [],
+        wishInfo: [],
+        isContinuous: false,
+        autoContinuousBtn: false,
+      });
       return true;
     }
     if (cmd === 3) {
@@ -906,6 +942,8 @@ function handle(conn, mod, cmd, ssid, body, ctx) {
       }
       reply(4, "GetSummonRewardR_SearchSummon_S2C", {
         err: 0,
+        freeSummon: [1, 2, 6, 7, 8, 9, 10].map((t) => ({ type: t, num: 0 })),
+        extractInfo: [],
         clientReward: { items: got },
         specialNum: 0,
         luckyNum: 0,
@@ -1063,11 +1101,98 @@ function runGM(p, req) {
   return "ok";
 }
 
+// ---------------- 战斗房间（module 90） ----------------
+// 客户端收到 82/1 的 addr 后会自己连过来，先发 90/1 Auth，
+// 认证通过后服务端必须主动推 90/12 StartGameP，战斗才会真正开始。
+// 主线/爬塔/挂机这类 battleType 的 getFrameSyncType() 都是 Local，
+// 也就是战场跑在客户端本地，只要 StartGameP 数据对就能打，不需要逐帧同步。
+function battleStartGameP(p, bt, lv, params) {
+  const heros = (heroList() || []).map((h) => {
+    const o = deepClone(h);
+    if (p && p.heroLevel) o.level = p.heroLevel;
+    return o;
+  });
+  const builds = [
+    // Door：Life=2，Defence=3。血量拉满，保证战场不会因为基地被打爆而秒退
+    { type: 1, attr: { 2: 1000000000, 3: 1 } },
+  ];
+  const organs = [1, 2, 3, 4, 5, 6, 7, 8].map((c) => ({
+    code: c,
+    star: c === 2 || c === 5 || c === 8 ? 4 : 1,
+    level: 1,
+    skillCode: 0,
+  }));
+  return {
+    playerInfos: [
+      {
+        playerId: p.playerId,
+        heros,
+        builds,
+        organs,
+        identity: 1,
+      },
+    ],
+    uuid: String(Date.now()),
+    battleType: bt,
+    level: lv,
+    battleVersion: params.get("bv") || "",
+    configVersion: params.get("cv") || "",
+    mapVersion: params.get("mv") || "",
+    adventureLevel: lv,
+    mapId: 0,
+  };
+}
+
+function handleBattle(conn, state, mod, cmd, ssid, body, params) {
+  const p = state.player;
+  const reply = (cmdOut, msg, obj) => {
+    conn.send(encodeS2C(mod, cmdOut, ssid, tryEncode(msg, obj)));
+  };
+
+  if (mod === 90) {
+    if (cmd === 1) {
+      reply(2, "AuthR_BuildRoom_S2C", { err: 0 });
+      const bt = Number(params.get("bt")) || 0;
+      const lv = Number(params.get("lv")) || 1;
+      setTimeout(() => {
+        try {
+          const sp = battleStartGameP(p, bt, lv, params);
+          log("[battle] StartGameP bt=" + bt + " lv=" + lv + " heros=" + sp.playerInfos[0].heros.length);
+          conn.send(encodeS2C(90, 12, 0, encode("StartGameP_BuildRoom_S2C", sp)));
+        } catch (e) {
+          log("[battle] StartGameP fail: " + e.message);
+        }
+      }, 300);
+      return true;
+    }
+    if (cmd === 3) {
+      reply(4, "PingR_BuildRoom_S2C", { err: 0, sysDt: now() });
+      return true;
+    }
+    // 其余指令统一按 cmd+1 回 {err:0}，让客户端继续跑
+    const outCmd = cmd + 1;
+    const outName = msgOf(90, outCmd);
+    if (outName) {
+      reply(outCmd, outName, { err: 0 });
+      return true;
+    }
+    return false;
+  }
+
+  if (mod === 82 && (cmd === 4 || cmd === 6)) {
+    reply(cmd === 4 ? 5 : 7, msgOf(82, cmd === 4 ? 5 : 7) || "QuitRoomR_Build_S2C", { err: 0 });
+    return true;
+  }
+
+  return false;
+}
+
 // ---------------- 连接 ----------------
 const clients = new Set();
 
-function attach(socket, gameUrl) {
+function attach(socket, gameUrl, role, params) {
   socket.binaryType = "arraybuffer";
+  const isBattle = role === "battle";
   const state = { player: null, ready: false, queue: [], gameUrl };
   const conn = {
     send(buf) {
@@ -1089,6 +1214,11 @@ function attach(socket, gameUrl) {
   const run = (buf) => {
     const f = decodeC2S(buf);
     if (!f) return;
+    if (isBattle) {
+      const ok = handleBattle(conn, state, f.module, f.cmd, f.ssid, f.body, params);
+      if (!ok) log("[battle-miss] mod" + f.module + "/cmd" + f.cmd);
+      return;
+    }
     const ctx = { player: state.player, gameUrl: state.gameUrl };
     const ok = handle(conn, f.module, f.cmd, f.ssid, f.body, ctx);
     if (!ok) log("[miss] mod" + f.module + "/cmd" + f.cmd);
@@ -1186,6 +1316,7 @@ Deno.serve({ port: PORT }, async (req) => {
     return new Response("YG private game server\n", { headers: { "content-type": "text/plain; charset=utf-8" } });
   }
   const { socket, response } = Deno.upgradeWebSocket(req);
-  bg(attach(socket, wsUrlOf(req)));
+  const q = new URL(req.url).searchParams;
+  bg(attach(socket, wsUrlOf(req), q.get("role") || "", q));
   return response;
 });
