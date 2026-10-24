@@ -16,6 +16,18 @@ const log = (...a) => {
 };
 const now = () => Math.floor(Date.now() / 1000);
 
+// 未实现的指令统计：客户端点了某个功能、服务端没接住，就会记在这里，
+// 通过 GET /logs?token=xxx 读出来，用来定位「哪个玩法打不开」
+const MISS = new Map();
+function miss(module, cmd, battle) {
+  const k = (battle ? "battle " : "") + module + "/" + cmd;
+  const e = MISS.get(k) || { n: 0, at: 0 };
+  e.n++;
+  e.at = now();
+  MISS.set(k, e);
+  log("[miss] " + k);
+}
+
 // 后台任务（Deno Deploy 防止 isolate 提前回收；本地跑没有 EdgeRuntime）
 function bg(p) {
   if (typeof EdgeRuntime !== "undefined" && EdgeRuntime.waitUntil) EdgeRuntime.waitUntil(p);
@@ -575,7 +587,10 @@ function adventureInfo(p) {
   return {
     level: 2,
     chapterId: 1,
-    lessTimes: 0,
+    // 主线体力：AdventureMainCom._onBtnChalenge 里先判断
+    // getNewAdvLessTime() < costs[2]，不足就直接弹「购买体力」窗口，
+    // 根本走不到进对局那一步。抓包真实值是 25，这里给 25。
+    lessTimes: 25,
     buyTimes: 0,
     getDt: p.createDt,
     targetList: [],
@@ -1221,12 +1236,12 @@ function attach(socket, gameUrl, role, params) {
     if (!f) return;
     if (isBattle) {
       const ok = handleBattle(conn, state, f.module, f.cmd, f.ssid, f.body, params);
-      if (!ok) log("[battle-miss] mod" + f.module + "/cmd" + f.cmd);
+      if (!ok) miss(f.module, f.cmd, true);
       return;
     }
     const ctx = { player: state.player, gameUrl: state.gameUrl };
     const ok = handle(conn, f.module, f.cmd, f.ssid, f.body, ctx);
-    if (!ok) log("[miss] mod" + f.module + "/cmd" + f.cmd);
+    if (!ok) miss(f.module, f.cmd, false);
   };
 
   socket.onopen = () => {
@@ -1315,6 +1330,21 @@ Deno.serve({ port: PORT }, async (req) => {
         t = "fail " + e.message;
       }
       return new Response(JSON.stringify({ ok: t.startsWith("ok"), tables: t, online: clients.size }), {
+        headers: { "content-type": "application/json; charset=utf-8" },
+      });
+    }
+    // 未实现指令统计：/logs?token=xxx 直接看，用于排查某个玩法为什么点了没反应
+    if (u.pathname === "/logs") {
+      if (u.searchParams.get("token") !== TOKEN) {
+        return new Response(JSON.stringify({ err: "token" }), {
+          status: 403,
+          headers: { "content-type": "application/json; charset=utf-8" },
+        });
+      }
+      const list = Array.from(MISS.entries())
+        .sort((a, b) => b[1].n - a[1].n)
+        .map(([k, v]) => ({ cmd: k, count: v.n, at: v.at }));
+      return new Response(JSON.stringify({ online: clients.size, miss: list }, null, 2), {
         headers: { "content-type": "application/json; charset=utf-8" },
       });
     }
