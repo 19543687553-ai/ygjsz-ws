@@ -146,10 +146,14 @@ function encodeField(w, f, v, def) {
       const valRef = def.valRef || def.ref;
       const valIsObj = def.valType === "object" || (!def.valType && !!valRef);
       const valType = def.valType || (valIsObj ? "object" : "string");
+      // key 类型：schema 只写了值类型，数字 key（如英雄 attr Map<uint32,uint32>）要编成 varint，
+      // 字符串 key（如 localStorage 的 UnlockFun）要编成 bytes，按实际 key 判断
+      const keyType = def.keyType ||
+        (entries.length && entries.every(([k]) => /^\d+$/.test(String(k))) ? "uint32" : "string");
       for (const [k, val] of entries) {
         const sub = new Writer();
-        sub.tag(1, wireTypeOf(def.keyType || "string"));
-        encodeScalar(sub, def.keyType || "string", k);
+        sub.tag(1, wireTypeOf(keyType));
+        encodeScalar(sub, keyType, k);
         sub.tag(2, wireTypeOf(valType));
         if (valIsObj) {
           const inner = val && typeof val === "object" ? val : { value: String(val), dt: 0 };
@@ -368,6 +372,9 @@ function tryEncode(name, obj) {
 const players = new Map();
 const saveTimers = new Map();
 
+// 从官方抓包（2/12）里抄下来的已完成新手引导步骤
+const GUIDE_DEFAULT = '{"10019000":1,"10021000":1,"10013000":1,"10022000":1,"10020000":1}';
+
 function defaultPlayer() {
   return {
     playerId: REPLAY.playerId || PLAYER_ID,
@@ -386,9 +393,10 @@ function defaultPlayer() {
       { code: 30000010, num: 999 },
       { code: 30000011, num: 999 },
     ],
-    // 客户端会 JSON.parse 后当字典用，必须是对象字符串，不能是纯数字
-    guide: "{}",
-    guideFlag: true,
+    // 客户端会 JSON.parse 后当字典用，必须是对象字符串，不能是纯数字。
+    // 先用官方抓包里已完成的新手引导，避免一直卡在“位置校验失败”
+    guide: GUIDE_DEFAULT,
+    guideFlag: false,
     localStorage: { UnlockFun: { value: "51000,5300,2201,49000", dt: 0 } },
   };
 }
@@ -407,7 +415,7 @@ async function loadPlayer(id) {
   const p = Object.assign(defaultPlayer(), saved || {});
   p.playerId = id || p.playerId || PLAYER_ID;
   // 兼容老存档：guide 必须是 JSON 对象串（客户端会 parse 后当字典写入）
-  if (typeof p.guide !== "string" || p.guide.trim()[0] !== "{") p.guide = "{}";
+  if (typeof p.guide !== "string" || p.guide.trim()[0] !== "{" || p.guide.trim() === "{}") p.guide = GUIDE_DEFAULT;
   return p;
 }
 
@@ -507,6 +515,22 @@ function buildCommonInfo(p) {
     o.guideInfo.localStorage = p.localStorage;
   }
   return o;
+}
+
+// 英雄列表：官方抓包里 23/1 的真实回包，升级等操作都以它为底
+let heroTpl = null;
+function heroList() {
+  if (heroTpl) return heroTpl;
+  heroTpl = [];
+  const rp = REPLAY.pairs && REPLAY.pairs["23/1"];
+  if (!rp) return heroTpl;
+  try {
+    heroTpl = decode("GetHeroInfoR_Hero_S2C", Buffer.from(rp.raw, "base64")).heroList || [];
+    log("[hero] 载入英雄 " + heroTpl.length + " 个");
+  } catch (e) {
+    log("[hero] 解析失败: " + e.message);
+  }
+  return heroTpl;
 }
 
 // 挂机（离线收益）基础信息：时间拉满，客户端才会显示"已满"并允许领取
@@ -799,6 +823,57 @@ function handle(conn, mod, cmd, ssid, body, ctx) {
           money: got.filter((r) => r.type <= 2),
           items: got.filter((r) => r.type >= 3),
         },
+      });
+      return true;
+    }
+  }
+
+  // 英雄 module 23：升级 / 升阶等都基于抓包里的真实英雄数据
+  if (mod === 23) {
+    if (cmd === 3) {
+      const list = heroList();
+      const h = list.find((x) => x.uuid === (req && req.uuid)) || list[0];
+      if (h) {
+        const up = JSON.parse(JSON.stringify(h));
+        up.level = (up.level || 1) + 1;
+        up.fightCap = Math.round((up.fightCap || 0) * 1.2);
+        reply(4, "HeroUpGradeR_Hero_S2C", { err: 0, hero: up });
+        return true;
+      }
+    }
+    if (cmd === 5 || cmd === 7) {
+      const list = heroList();
+      const h = list.find((x) => x.uuid === (req && req.uuid)) || list[0];
+      if (h) {
+        const up = JSON.parse(JSON.stringify(h));
+        if (cmd === 5) up.section = (up.section || 0) + 1;
+        else up.crown = (up.crown || 0) + 1;
+        up.fightCap = Math.round((up.fightCap || 0) * 1.2);
+        reply(cmd + 1, cmd === 5 ? "HeroUpSectionR_Hero_S2C" : "HeroUpStarR_Hero_S2C", { err: 0, hero: up });
+        return true;
+      }
+    }
+  }
+
+  // 抽卡 module 26
+  if (mod === 26) {
+    if (cmd === 1) {
+      reply(2, "GetSearchSummonInfoR_SearchSummon_S2C", { err: 0 });
+      return true;
+    }
+    if (cmd === 3) {
+      const times = (req && req.code) === 1010 ? 10 : 1;
+      const got = [];
+      for (let i = 0; i < times; i++) {
+        const code = 30000004 + (i % 8);
+        addItem(p, code, 1);
+        got.push({ type: 3, code, num: 1 });
+      }
+      reply(4, "GetSummonRewardR_SearchSummon_S2C", {
+        err: 0,
+        clientReward: { items: got },
+        specialNum: 0,
+        luckyNum: 0,
       });
       return true;
     }
